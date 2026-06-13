@@ -39,7 +39,7 @@ type NodePayload struct {
 }
 
 func Load() (Config, error) {
-	secret := os.Getenv("SECRET_KEY")
+	secret := normalizeSecret(os.Getenv("SECRET_KEY"))
 	if secret == "" {
 		return Config{}, errors.New("SECRET_KEY is required")
 	}
@@ -113,6 +113,11 @@ func normalizePEM(value string) string {
 	value = strings.ReplaceAll(value, "\r\n", "\n")
 	value = strings.TrimSpace(value)
 	return value
+}
+
+func normalizeSecret(value string) string {
+	value = strings.TrimSpace(value)
+	return strings.Trim(value, "\"")
 }
 
 func envString(key, fallback string) string {
