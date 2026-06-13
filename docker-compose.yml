@@ -1,7 +1,8 @@
 services:
   remnanode:
     container_name: remnanode
-    image: ${REMNAWAVE_IMAGE:-remnawave-node-go:test}
+    image: ${REMNAWAVE_IMAGE:-ghcr.io/wuansg/remnawave-node-go:main}
+    pull_policy: always
     network_mode: host
     restart: unless-stopped
     environment:
