@@ -1,12 +1,14 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/remnawave/remnawave-node-go/internal/auth"
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	nodeapp "github.com/remnawave/remnawave-node-go/internal/node"
@@ -314,11 +317,42 @@ func (s *Server) requireInternalToken(next http.HandlerFunc) http.HandlerFunc {
 
 func decodeJSON[T any](w http.ResponseWriter, r *http.Request, out *T) bool {
 	defer r.Body.Close()
-	if err := json.NewDecoder(r.Body).Decode(out); err != nil {
+	payload, err := decodeRequestBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"message": "invalid JSON body"})
+		return false
+	}
+	if err := json.Unmarshal(payload, out); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"message": "invalid JSON body"})
 		return false
 	}
 	return true
+}
+
+func decodeRequestBody(r *http.Request) ([]byte, error) {
+	reader := io.Reader(r.Body)
+	encoding := strings.TrimSpace(strings.ToLower(r.Header.Get("Content-Encoding")))
+	switch encoding {
+	case "", "identity":
+	case "zstd":
+		decoder, err := zstd.NewReader(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		defer decoder.Close()
+		reader = decoder
+	default:
+		return nil, fmt.Errorf("unsupported content encoding: %s", encoding)
+	}
+
+	payload, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return nil, io.EOF
+	}
+	return payload, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
