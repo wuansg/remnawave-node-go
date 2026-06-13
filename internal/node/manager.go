@@ -24,6 +24,7 @@ const (
 	xrayProcessName    = "xray"
 	singBoxProcessName = "sing-box"
 	nftTableName       = "remnanode"
+	xrayAPITag         = "remnawave-api"
 )
 
 var (
@@ -299,17 +300,10 @@ func (m *Manager) GetSystemStats() map[string]any {
 	}
 }
 
-func (m *Manager) GetUserOnlineStatus(request GetUserOnlineStatusRequest) map[string]any {
-	if m.state.RunningCoreType() == state.CoreTypeSingBox {
-		return map[string]any{"response": map[string]any{"isOnline": false}}
-	}
-	now := time.Now()
-	online := false
-	for _, item := range m.state.UserIPs(request.Username) {
-		if now.Sub(item.LastSeen) <= 10*time.Minute {
-			online = true
-			break
-		}
+func (m *Manager) GetUserOnlineStatus(ctx context.Context, request GetUserOnlineStatusRequest) map[string]any {
+	online, err := m.userConnectionProvider().UserOnlineStatus(ctx, request.Username)
+	if err != nil {
+		online = false
 	}
 	return map[string]any{"response": map[string]any{"isOnline": online}}
 }
@@ -365,42 +359,20 @@ func (m *Manager) GetCombinedStats() map[string]any {
 	return map[string]any{"response": map[string]any{"inbounds": inbounds, "outbounds": []map[string]any{}}}
 }
 
-func (m *Manager) GetUserIPList(request GetUserIPListRequest) map[string]any {
-	if m.state.RunningCoreType() == state.CoreTypeSingBox {
+func (m *Manager) GetUserIPList(ctx context.Context, request GetUserIPListRequest) map[string]any {
+	items, err := m.userConnectionProvider().UserIPList(ctx, request.UserID)
+	if err != nil {
 		return map[string]any{"response": map[string]any{"ips": []map[string]any{}}}
 	}
-	items := []map[string]any{}
-	for _, ip := range m.state.UserIPs(request.UserID) {
-		items = append(items, map[string]any{
-			"ip":       ip.IP,
-			"lastSeen": ip.LastSeen.Format(time.RFC3339),
-		})
-	}
-	return map[string]any{"response": map[string]any{"ips": items}}
+	return map[string]any{"response": map[string]any{"ips": formatSeenIPs(items)}}
 }
 
-func (m *Manager) GetUsersIPList() map[string]any {
-	if m.state.RunningCoreType() == state.CoreTypeSingBox {
+func (m *Manager) GetUsersIPList(ctx context.Context) map[string]any {
+	items, err := m.userConnectionProvider().UsersIPList(ctx)
+	if err != nil {
 		return map[string]any{"response": map[string]any{"users": []map[string]any{}}}
 	}
-	users := []map[string]any{}
-	for userID, items := range m.state.AllUserIPs() {
-		ips := []map[string]any{}
-		for _, ip := range items {
-			ips = append(ips, map[string]any{
-				"ip":       ip.IP,
-				"lastSeen": ip.LastSeen.Format(time.RFC3339),
-			})
-		}
-		users = append(users, map[string]any{
-			"userId": userID,
-			"ips":    ips,
-		})
-	}
-	sort.Slice(users, func(i, j int) bool {
-		return users[i]["userId"].(string) < users[j]["userId"].(string)
-	})
-	return map[string]any{"response": map[string]any{"users": users}}
+	return map[string]any{"response": map[string]any{"users": formatUserIPLists(items)}}
 }
 
 func (m *Manager) GetInboundUsers(request GetInboundUsersRequest) map[string]any {
@@ -460,13 +432,46 @@ func (m *Manager) RemoveUsers(ctx context.Context, request RemoveUsersRequest) m
 	return map[string]any{"response": map[string]any{"success": true, "error": nil}}
 }
 
-func (m *Manager) DropUsersConnections(request DropUsersConnectionsRequest) map[string]any {
+func (m *Manager) DropUsersConnections(ctx context.Context, request DropUsersConnectionsRequest) map[string]any {
 	for _, userID := range request.UserIDs {
-		for _, item := range m.state.UserIPs(userID) {
+		items, err := m.userConnectionProvider().UserIPList(ctx, userID)
+		if err != nil {
+			continue
+		}
+		for _, item := range items {
 			m.dropConnections(item.IP)
 		}
 	}
 	return map[string]any{"response": map[string]any{"success": true}}
+}
+
+func (m *Manager) userConnectionProvider() UserConnectionProvider {
+	return newUserConnectionProvider(m.cfg.XtlsAPIPort, m.state)
+}
+
+func formatSeenIPs(items []state.SeenIP) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, ip := range items {
+		out = append(out, map[string]any{
+			"ip":       ip.IP,
+			"lastSeen": ip.LastSeen.Format(time.RFC3339),
+		})
+	}
+	return out
+}
+
+func formatUserIPLists(items map[string][]state.SeenIP) []map[string]any {
+	users := make([]map[string]any, 0, len(items))
+	for userID, seenIPs := range items {
+		users = append(users, map[string]any{
+			"userId": userID,
+			"ips":    formatSeenIPs(seenIPs),
+		})
+	}
+	sort.Slice(users, func(i, j int) bool {
+		return users[i]["userId"].(string) < users[j]["userId"].(string)
+	})
+	return users
 }
 
 func (m *Manager) DropIPs(request DropIPsRequest) map[string]any {
@@ -892,8 +897,16 @@ func applyXrayAPIConfig(config map[string]any, cfg config.Config, pluginState st
 	if len(config) == 0 {
 		return config
 	}
+	apiTag := ensureXrayStatsConfig(config, cfg.XtlsAPIPort)
 	routing := ensureMap(config, "routing")
 	rules := ensureSliceMap(routing, "rules")
+	if !hasXrayAPIRoute(rules, apiTag) {
+		rules = append([]map[string]any{{
+			"type":        "field",
+			"inboundTag":  []any{apiTag},
+			"outboundTag": apiTag,
+		}}, rules...)
+	}
 	if pluginState.TorrentEnabled {
 		webhookURL := fmt.Sprintf("/%s:/internal/webhook?token=%s", cfg.InternalSocketPath, cfg.InternalRESTToken)
 		rule := map[string]any{
@@ -904,10 +917,85 @@ func applyXrayAPIConfig(config map[string]any, cfg config.Config, pluginState st
 			},
 		}
 		rules = append([]map[string]any{rule}, rules...)
-		routing["rules"] = toAnySlice(rules)
 	}
+	routing["rules"] = toAnySlice(rules)
 	config["routing"] = routing
 	return config
+}
+
+func ensureXrayStatsConfig(config map[string]any, apiPort int) string {
+	if config["stats"] == nil {
+		config["stats"] = map[string]any{}
+	}
+
+	api := ensureMap(config, "api")
+	apiTag := firstNonEmpty(stringValue(api["tag"]), xrayAPITag)
+	api["tag"] = apiTag
+	if apiPort > 0 {
+		api["listen"] = fmt.Sprintf("127.0.0.1:%d", apiPort)
+	}
+	api["services"] = toAnyStringSlice(appendUniqueString(valueStrings(api["services"]), "StatsService"))
+	config["api"] = api
+
+	policy := ensureMap(config, "policy")
+	levels := ensureMap(policy, "levels")
+	level0 := ensureMap(levels, "0")
+	level0["statsUserUplink"] = true
+	level0["statsUserDownlink"] = true
+	level0["statsUserOnline"] = true
+
+	system := ensureMap(policy, "system")
+	system["statsInboundUplink"] = true
+	system["statsInboundDownlink"] = true
+	system["statsOutboundUplink"] = true
+	system["statsOutboundDownlink"] = true
+	policy["levels"] = levels
+	policy["system"] = system
+	config["policy"] = policy
+
+	if apiPort <= 0 {
+		return apiTag
+	}
+
+	inbounds := ensureSliceMap(config, "inbounds")
+	apiInbound := map[string]any{
+		"tag":      apiTag,
+		"listen":   "127.0.0.1",
+		"port":     apiPort,
+		"protocol": "dokodemo-door",
+		"settings": map[string]any{
+			"address": "127.0.0.1",
+		},
+	}
+	replaced := false
+	for idx, inbound := range inbounds {
+		if stringValue(inbound["tag"]) != apiTag {
+			continue
+		}
+		inbounds[idx] = apiInbound
+		replaced = true
+		break
+	}
+	if !replaced {
+		inbounds = append(inbounds, apiInbound)
+	}
+	config["inbounds"] = toAnySlice(inbounds)
+
+	return apiTag
+}
+
+func hasXrayAPIRoute(rules []map[string]any, apiTag string) bool {
+	for _, rule := range rules {
+		if stringValue(rule["outboundTag"]) != apiTag {
+			continue
+		}
+		for _, inboundTag := range valueStrings(rule["inboundTag"]) {
+			if inboundTag == apiTag {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func addXrayUser(config map[string]any, item AddUserItem) error {
@@ -1247,14 +1335,24 @@ func numberStrings(value any) []string {
 }
 
 func stringSlice(value any) []string {
-	items := asAnySlice(value)
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		if typed, ok := item.(string); ok {
-			out = append(out, typed)
+	switch typed := value.(type) {
+	case []string:
+		return append([]string{}, typed...)
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
 		}
+		return out
+	default:
+		return []string{}
 	}
-	return out
+}
+
+func valueStrings(value any) []string {
+	return stringSlice(value)
 }
 
 func sliceToSet(values []string) map[string]struct{} {
@@ -1324,6 +1422,23 @@ func toAnySlice(values []map[string]any) []any {
 		out = append(out, value)
 	}
 	return out
+}
+
+func toAnyStringSlice(values []string) []any {
+	out := make([]any, 0, len(values))
+	for _, value := range values {
+		out = append(out, value)
+	}
+	return out
+}
+
+func appendUniqueString(values []string, target string) []string {
+	for _, value := range values {
+		if value == target {
+			return values
+		}
+	}
+	return append(values, target)
 }
 
 func firstNonEmpty(values ...string) string {

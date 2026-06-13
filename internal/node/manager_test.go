@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -64,17 +65,17 @@ func TestSingBoxUserConnectionStatsReturnEmpty(t *testing.T) {
 
 	manager := &Manager{state: runtimeState}
 
-	userIPs := manager.GetUserIPList(GetUserIPListRequest{UserID: "2"})
+	userIPs := manager.GetUserIPList(context.Background(), GetUserIPListRequest{UserID: "2"})
 	if got := len(userIPs["response"].(map[string]any)["ips"].([]map[string]any)); got != 0 {
 		t.Fatalf("expected sing-box user ip list to be empty, got %d items", got)
 	}
 
-	usersIPs := manager.GetUsersIPList()
+	usersIPs := manager.GetUsersIPList(context.Background())
 	if got := len(usersIPs["response"].(map[string]any)["users"].([]map[string]any)); got != 0 {
 		t.Fatalf("expected sing-box users ip list to be empty, got %d users", got)
 	}
 
-	online := manager.GetUserOnlineStatus(GetUserOnlineStatusRequest{Username: "2"})
+	online := manager.GetUserOnlineStatus(context.Background(), GetUserOnlineStatusRequest{Username: "2"})
 	if online["response"].(map[string]any)["isOnline"].(bool) {
 		t.Fatalf("expected sing-box user online status to be false")
 	}
@@ -87,12 +88,12 @@ func TestXrayUserConnectionStatsUseRecordedIPs(t *testing.T) {
 
 	manager := &Manager{state: runtimeState}
 
-	userIPs := manager.GetUserIPList(GetUserIPListRequest{UserID: "2"})
+	userIPs := manager.GetUserIPList(context.Background(), GetUserIPListRequest{UserID: "2"})
 	if got := len(userIPs["response"].(map[string]any)["ips"].([]map[string]any)); got != 1 {
 		t.Fatalf("expected xray user ip list to contain 1 item, got %d", got)
 	}
 
-	usersIPs := manager.GetUsersIPList()
+	usersIPs := manager.GetUsersIPList(context.Background())
 	if got := len(usersIPs["response"].(map[string]any)["users"].([]map[string]any)); got != 1 {
 		t.Fatalf("expected xray users ip list to contain 1 user, got %d", got)
 	}

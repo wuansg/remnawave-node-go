@@ -170,7 +170,7 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.manager.DropUsersConnections(body))
+		writeJSON(w, http.StatusOK, s.manager.DropUsersConnections(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/handler/drop-ips", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.DropIPsRequest
@@ -185,7 +185,7 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.manager.GetUserOnlineStatus(body))
+		writeJSON(w, http.StatusOK, s.manager.GetUserOnlineStatus(r.Context(), body))
 	}))
 	mux.HandleFunc("GET /node/stats/get-system-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.manager.GetSystemStats())
@@ -221,10 +221,10 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.manager.GetUserIPList(body))
+		writeJSON(w, http.StatusOK, s.manager.GetUserIPList(r.Context(), body))
 	}))
 	mux.HandleFunc("GET /node/stats/get-users-ip-list", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.manager.GetUsersIPList())
+		writeJSON(w, http.StatusOK, s.manager.GetUsersIPList(r.Context()))
 	}))
 
 	mux.HandleFunc("POST /node/plugin/sync", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
