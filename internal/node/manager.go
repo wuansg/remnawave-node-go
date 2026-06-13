@@ -300,6 +300,9 @@ func (m *Manager) GetSystemStats() map[string]any {
 }
 
 func (m *Manager) GetUserOnlineStatus(request GetUserOnlineStatusRequest) map[string]any {
+	if m.state.RunningCoreType() == state.CoreTypeSingBox {
+		return map[string]any{"response": map[string]any{"isOnline": false}}
+	}
 	now := time.Now()
 	online := false
 	for _, item := range m.state.UserIPs(request.Username) {
@@ -363,6 +366,9 @@ func (m *Manager) GetCombinedStats() map[string]any {
 }
 
 func (m *Manager) GetUserIPList(request GetUserIPListRequest) map[string]any {
+	if m.state.RunningCoreType() == state.CoreTypeSingBox {
+		return map[string]any{"response": map[string]any{"ips": []map[string]any{}}}
+	}
 	items := []map[string]any{}
 	for _, ip := range m.state.UserIPs(request.UserID) {
 		items = append(items, map[string]any{
@@ -374,6 +380,9 @@ func (m *Manager) GetUserIPList(request GetUserIPListRequest) map[string]any {
 }
 
 func (m *Manager) GetUsersIPList() map[string]any {
+	if m.state.RunningCoreType() == state.CoreTypeSingBox {
+		return map[string]any{"response": map[string]any{"users": []map[string]any{}}}
+	}
 	users := []map[string]any{}
 	for userID, items := range m.state.AllUserIPs() {
 		ips := []map[string]any{}

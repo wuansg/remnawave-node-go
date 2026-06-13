@@ -1,6 +1,11 @@
 package node
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	"github.com/remnawave/remnawave-node-go/internal/state"
+)
 
 func TestAddSingBoxUserSupportsAnyTLSHy2AndTUIC(t *testing.T) {
 	config := map[string]any{
@@ -49,5 +54,46 @@ func TestAddSingBoxUserSupportsAnyTLSHy2AndTUIC(t *testing.T) {
 	}
 	if got := stringValue(tuicUsers[0]["password"]); got != "trojan-password" {
 		t.Fatalf("unexpected tuic password: %s", got)
+	}
+}
+
+func TestSingBoxUserConnectionStatsReturnEmpty(t *testing.T) {
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.RecordUserIP("2", "163.125.176.65", time.Unix(1710000000, 0))
+
+	manager := &Manager{state: runtimeState}
+
+	userIPs := manager.GetUserIPList(GetUserIPListRequest{UserID: "2"})
+	if got := len(userIPs["response"].(map[string]any)["ips"].([]map[string]any)); got != 0 {
+		t.Fatalf("expected sing-box user ip list to be empty, got %d items", got)
+	}
+
+	usersIPs := manager.GetUsersIPList()
+	if got := len(usersIPs["response"].(map[string]any)["users"].([]map[string]any)); got != 0 {
+		t.Fatalf("expected sing-box users ip list to be empty, got %d users", got)
+	}
+
+	online := manager.GetUserOnlineStatus(GetUserOnlineStatusRequest{Username: "2"})
+	if online["response"].(map[string]any)["isOnline"].(bool) {
+		t.Fatalf("expected sing-box user online status to be false")
+	}
+}
+
+func TestXrayUserConnectionStatsUseRecordedIPs(t *testing.T) {
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeXRAY)
+	runtimeState.RecordUserIP("2", "163.125.176.65", time.Unix(1710000000, 0))
+
+	manager := &Manager{state: runtimeState}
+
+	userIPs := manager.GetUserIPList(GetUserIPListRequest{UserID: "2"})
+	if got := len(userIPs["response"].(map[string]any)["ips"].([]map[string]any)); got != 1 {
+		t.Fatalf("expected xray user ip list to contain 1 item, got %d", got)
+	}
+
+	usersIPs := manager.GetUsersIPList()
+	if got := len(usersIPs["response"].(map[string]any)["users"].([]map[string]any)); got != 1 {
+		t.Fatalf("expected xray users ip list to contain 1 user, got %d", got)
 	}
 }
