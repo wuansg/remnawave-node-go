@@ -1,0 +1,18 @@
+services:
+  remnanode:
+    container_name: remnanode
+    image: ${REMNAWAVE_IMAGE:-remnawave-node-go:test}
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      NODE_PORT: ${NODE_PORT}
+      SECRET_KEY: ${SECRET_KEY}
+      XTLS_API_PORT: ${XTLS_API_PORT}
+      SING_BOX_API_PORT: ${SING_BOX_API_PORT}
+      INTERNAL_SOCKET_PATH: ${INTERNAL_SOCKET_PATH:-/run/remnawave/internal.sock}
+      SUPERVISORD_SOCKET_PATH: ${SUPERVISORD_SOCKET_PATH:-/run/remnawave/supervisord.sock}
+      SUPERVISORD_PID_PATH: ${SUPERVISORD_PID_PATH:-/run/remnawave/supervisord.pid}
+      XRAY_CONFIG_PATH: ${XRAY_CONFIG_PATH:-/run/remnawave/xray.json}
+      SING_BOX_CONFIG_PATH: ${SING_BOX_CONFIG_PATH:-/run/remnawave/sing-box.json}
+    volumes:
+      - ${ANYTLS_CERT_DIR:-/root/cert/anytls}:${ANYTLS_CERT_DIR:-/root/cert/anytls}:ro
