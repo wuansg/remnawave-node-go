@@ -25,10 +25,12 @@ FROM golang:1.25-alpine AS sing-box-build
 ARG SING_BOX_VERSION=v1.13.13
 
 WORKDIR /src
+COPY third_party/sing-box-patches /patches
 
-RUN apk add --no-cache git build-base \
+RUN apk add --no-cache git build-base patch \
     && git clone --depth 1 --branch ${SING_BOX_VERSION} https://github.com/SagerNet/sing-box.git . \
-    && go build -tags "with_v2ray_api,with_quic" -o /usr/local/bin/sing-box ./cmd/sing-box
+    && patch -p1 < /patches/0001-expose-user-in-clash-connections.patch \
+    && go build -tags "with_v2ray_api,with_clash_api,with_quic" -o /usr/local/bin/sing-box ./cmd/sing-box
 
 
 FROM alpine:3.22

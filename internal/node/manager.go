@@ -218,7 +218,7 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 
 	switch coreType {
 	case state.CoreTypeSingBox:
-		config := normalizeSingBoxKeys(cloneMap(request.SingBoxConfig))
+		config := applySingBoxAPIConfig(normalizeSingBoxKeys(cloneMap(request.SingBoxConfig)), m.cfg)
 		if len(config) == 0 {
 			return wrapStartResponse(false, nil, ptrString("singBoxConfig is required for SING_BOX core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
 		}
@@ -433,8 +433,14 @@ func (m *Manager) RemoveUsers(ctx context.Context, request RemoveUsersRequest) m
 }
 
 func (m *Manager) DropUsersConnections(ctx context.Context, request DropUsersConnectionsRequest) map[string]any {
+	provider := m.userConnectionProvider()
 	for _, userID := range request.UserIDs {
-		items, err := m.userConnectionProvider().UserIPList(ctx, userID)
+		if closer, ok := provider.(UserConnectionCloser); ok {
+			if err := closer.CloseUserConnections(ctx, userID); err == nil {
+				continue
+			}
+		}
+		items, err := provider.UserIPList(ctx, userID)
 		if err != nil {
 			continue
 		}
@@ -446,7 +452,7 @@ func (m *Manager) DropUsersConnections(ctx context.Context, request DropUsersCon
 }
 
 func (m *Manager) userConnectionProvider() UserConnectionProvider {
-	return newUserConnectionProvider(m.cfg.XtlsAPIPort, m.state)
+	return newUserConnectionProvider(m.cfg.XtlsAPIPort, m.cfg.SingBoxAPIPort, m.cfg.InternalRESTToken, m.state)
 }
 
 func formatSeenIPs(items []state.SeenIP) []map[string]any {
@@ -638,6 +644,8 @@ func (m *Manager) restartXray(ctx context.Context) error {
 }
 
 func (m *Manager) restartSingBox(ctx context.Context, config map[string]any) error {
+	config = applySingBoxAPIConfig(cloneMap(config), m.cfg)
+	m.state.SetSingBoxConfig(config)
 	if err := os.MkdirAll(filepath.Dir(m.cfg.SingBoxConfigPath), 0o755); err != nil {
 		return err
 	}
@@ -996,6 +1004,22 @@ func hasXrayAPIRoute(rules []map[string]any, apiTag string) bool {
 		}
 	}
 	return false
+}
+
+func applySingBoxAPIConfig(config map[string]any, cfg config.Config) map[string]any {
+	if len(config) == 0 || cfg.SingBoxAPIPort <= 0 {
+		return config
+	}
+
+	experimental := ensureMap(config, "experimental")
+	clashAPI := ensureMap(experimental, "clash_api")
+	clashAPI["external_controller"] = fmt.Sprintf("127.0.0.1:%d", cfg.SingBoxAPIPort)
+	if cfg.InternalRESTToken != "" {
+		clashAPI["secret"] = cfg.InternalRESTToken
+	}
+	experimental["clash_api"] = clashAPI
+	config["experimental"] = experimental
+	return config
 }
 
 func addXrayUser(config map[string]any, item AddUserItem) error {
