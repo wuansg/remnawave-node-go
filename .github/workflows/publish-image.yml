@@ -13,6 +13,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  REMNAWAVE_NODE_VERSION: 2.7.0
 
 jobs:
   docker:
@@ -49,5 +50,7 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
+          build-args: |
+            REMNAWAVE_NODE_VERSION=${{ env.REMNAWAVE_NODE_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

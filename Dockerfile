@@ -1,9 +1,13 @@
 FROM golang:1.26.4-alpine AS go-build
 
+ARG REMNAWAVE_NODE_VERSION=2.7.0
+
 WORKDIR /src
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/remnawave-node-go ./cmd/remnawave-node-go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags "-X github.com/remnawave/remnawave-node-go/internal/config.buildVersion=${REMNAWAVE_NODE_VERSION}" \
+    -o /out/remnawave-node-go ./cmd/remnawave-node-go
 
 
 FROM alpine:3.22 AS xray-build

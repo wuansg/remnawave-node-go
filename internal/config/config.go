@@ -13,6 +13,8 @@ import (
 	"strings"
 )
 
+var buildVersion = "2.7.0"
+
 type Config struct {
 	NodePort           int
 	SecretKey          string
@@ -148,8 +150,14 @@ func envBool(key string, fallback bool) bool {
 }
 
 func detectVersion() string {
+	if value := strings.TrimSpace(os.Getenv("REMNAWAVE_NODE_VERSION")); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(buildVersion); value != "" {
+		return value
+	}
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
 		return info.Main.Version
 	}
-	return "0.0.0-go"
+	return "2.7.0"
 }
