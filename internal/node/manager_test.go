@@ -2,12 +2,15 @@ package node
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	"github.com/remnawave/remnawave-node-go/internal/coreapi"
 	"github.com/remnawave/remnawave-node-go/internal/state"
+	"github.com/remnawave/remnawave-node-go/internal/system"
 )
 
 type fakeStatsClient struct {
@@ -89,6 +92,23 @@ func TestGetInboundStatsAggregatesDirections(t *testing.T) {
 	item := response["response"].(map[string]any)
 	if item["uplink"] != int64(11) || item["downlink"] != int64(22) {
 		t.Fatalf("unexpected inbound stats: %#v", item)
+	}
+}
+
+func TestGetSystemStatsAlwaysIncludesCoreInfo(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager := &Manager{
+		state:   state.New("test"),
+		network: system.NewNetworkMonitor(logger),
+	}
+	response := manager.GetSystemStats(context.Background())
+	xrayInfo := response["response"].(map[string]any)["xrayInfo"]
+	stats, ok := xrayInfo.(map[string]any)
+	if !ok {
+		t.Fatalf("xrayInfo must be an object, got %#v", xrayInfo)
+	}
+	if stats["uptime"] != 0 || len(stats) != 10 {
+		t.Fatalf("unexpected offline core stats: %#v", stats)
 	}
 }
 

@@ -387,7 +387,18 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 func (m *Manager) GetSystemStats(ctx context.Context) map[string]any {
 	snapshot := system.SystemSnapshot(m.network)
 	pluginState := m.state.PluginState()
-	var coreStats any
+	coreStats := map[string]any{
+		"numGoroutine": 0,
+		"numGC":        0,
+		"alloc":        0,
+		"totalAlloc":   0,
+		"sys":          0,
+		"mallocs":      0,
+		"frees":        0,
+		"liveObjects":  0,
+		"pauseTotalNs": 0,
+		"uptime":       0,
+	}
 	if client := m.statsClient(); client != nil {
 		if stats, err := client.System(ctx); err == nil {
 			coreStats = map[string]any{
