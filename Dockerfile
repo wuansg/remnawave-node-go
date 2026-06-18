@@ -68,6 +68,7 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
 ENV NODE_PORT=2222
 ENV XTLS_API_PORT=61000
 ENV SING_BOX_API_PORT=61001
+ENV SING_BOX_V2RAY_API_PORT=61002
 ENV XRAY_CONFIG_PATH=/run/remnawave/xray.json
 ENV SING_BOX_CONFIG_PATH=/run/remnawave/sing-box.json
 

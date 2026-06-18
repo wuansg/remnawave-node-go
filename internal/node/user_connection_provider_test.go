@@ -220,8 +220,9 @@ func TestApplySingBoxAPIConfigEnablesClashAPI(t *testing.T) {
 	}
 
 	out := applySingBoxAPIConfig(config, cfgpkg.Config{
-		SingBoxAPIPort:    61001,
-		InternalRESTToken: "test-secret",
+		SingBoxAPIPort:      61001,
+		SingBoxV2RayAPIPort: 61002,
+		InternalRESTToken:   "test-secret",
 	})
 
 	experimental := ensureConfigMap(out["experimental"])
@@ -233,7 +234,7 @@ func TestApplySingBoxAPIConfigEnablesClashAPI(t *testing.T) {
 		t.Fatalf("expected sing-box clash api secret to be set, got %#v", clashAPI)
 	}
 	v2rayAPI := ensureConfigMap(experimental["v2ray_api"])
-	if stringValue(v2rayAPI["listen"]) != "127.0.0.1:61001" {
+	if stringValue(v2rayAPI["listen"]) != "127.0.0.1:61002" {
 		t.Fatalf("unexpected sing-box v2ray api address: %#v", v2rayAPI)
 	}
 }

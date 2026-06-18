@@ -209,7 +209,7 @@ func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Log
 	if err != nil {
 		return nil, err
 	}
-	singStats, err := coreapi.NewSingBoxStatsClient(fmt.Sprintf("127.0.0.1:%d", cfg.SingBoxAPIPort), insecure.NewCredentials())
+	singStats, err := coreapi.NewSingBoxStatsClient(fmt.Sprintf("127.0.0.1:%d", singBoxV2RayAPIPort(cfg)), insecure.NewCredentials())
 	if err != nil {
 		_ = xrayStats.Close()
 		return nil, err
@@ -1519,7 +1519,7 @@ func applySingBoxAPIConfig(config map[string]any, cfg config.Config) map[string]
 		}
 	}
 	experimental["v2ray_api"] = map[string]any{
-		"listen": fmt.Sprintf("127.0.0.1:%d", cfg.SingBoxAPIPort),
+		"listen": fmt.Sprintf("127.0.0.1:%d", singBoxV2RayAPIPort(cfg)),
 		"stats": map[string]any{
 			"enabled":   true,
 			"inbounds":  toAnyStringSlice(statsInbounds),
@@ -1535,6 +1535,13 @@ func applySingBoxAPIConfig(config map[string]any, cfg config.Config) map[string]
 	experimental["clash_api"] = clashAPI
 	config["experimental"] = experimental
 	return config
+}
+
+func singBoxV2RayAPIPort(cfg config.Config) int {
+	if cfg.SingBoxV2RayAPIPort > 0 {
+		return cfg.SingBoxV2RayAPIPort
+	}
+	return cfg.SingBoxAPIPort + 1
 }
 
 func addXrayUser(config map[string]any, item AddUserItem) error {
