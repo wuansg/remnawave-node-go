@@ -5,8 +5,98 @@ import (
 	"testing"
 	"time"
 
+	"github.com/remnawave/remnawave-node-go/internal/config"
+	"github.com/remnawave/remnawave-node-go/internal/coreapi"
 	"github.com/remnawave/remnawave-node-go/internal/state"
 )
+
+type fakeStatsClient struct {
+	stats       []coreapi.Stat
+	lastPattern string
+	lastReset   bool
+}
+
+func (f *fakeStatsClient) Query(_ context.Context, pattern string, reset bool) ([]coreapi.Stat, error) {
+	f.lastPattern, f.lastReset = pattern, reset
+	return f.stats, nil
+}
+func (f *fakeStatsClient) System(context.Context) (coreapi.SystemStats, error) {
+	return coreapi.SystemStats{NumGoroutine: 7, Uptime: 42}, nil
+}
+func (f *fakeStatsClient) Online(context.Context, string) (bool, error) { return true, nil }
+func (f *fakeStatsClient) UserIPs(context.Context, string) (map[string]int64, error) {
+	return map[string]int64{"1.1.1.1": 1710000000}, nil
+}
+func (f *fakeStatsClient) OnlineUsers(context.Context) ([]string, error) {
+	return []string{"user-a"}, nil
+}
+func (f *fakeStatsClient) Close() error { return nil }
+
+func TestShouldRestartCoreIncludesCoreStatusAndConfiguration(t *testing.T) {
+	hashes := state.StartHashes{
+		EmptyConfig: "base",
+		Inbounds:    []state.InboundHash{{Tag: "in", Hash: "users", UsersCount: 1}},
+	}
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeXRAY)
+	runtimeState.SetOnlineStatus(true, false)
+	runtimeState.SetLastHashes(hashes)
+
+	manager := &Manager{state: runtimeState}
+	if manager.shouldRestartCore(state.CoreTypeXRAY, false, hashes) {
+		t.Fatal("unchanged online core should not restart")
+	}
+	if !manager.shouldRestartCore(state.CoreTypeSingBox, false, hashes) {
+		t.Fatal("switching core must restart even when hashes match")
+	}
+
+	runtimeState.SetOnlineStatus(false, false)
+	if !manager.shouldRestartCore(state.CoreTypeXRAY, false, hashes) {
+		t.Fatal("offline core must restart even when hashes match")
+	}
+
+	runtimeState.SetOnlineStatus(true, false)
+	manager.cfg = config.Config{DisableHashCheck: true}
+	if !manager.shouldRestartCore(state.CoreTypeXRAY, false, hashes) {
+		t.Fatal("disabled hash checks must force a restart")
+	}
+}
+
+func TestGetUsersStatsUsesCoreStatsAndReset(t *testing.T) {
+	client := &fakeStatsClient{stats: []coreapi.Stat{
+		{Name: "user>>>user-a>>>traffic>>>uplink", Value: 10},
+		{Name: "user>>>user-a>>>traffic>>>downlink", Value: 20},
+		{Name: "user>>>idle>>>traffic>>>uplink", Value: 0},
+	}}
+	manager := &Manager{state: state.New("test"), xrayStats: client}
+	response := manager.GetUsersStats(context.Background(), GetUsersStatsRequest{Reset: true})
+	users := response["response"].(map[string]any)["users"].([]map[string]any)
+	if len(users) != 1 || users[0]["username"] != "user-a" || users[0]["uplink"] != int64(10) || users[0]["downlink"] != int64(20) {
+		t.Fatalf("unexpected user stats: %#v", users)
+	}
+	if client.lastPattern != "user>>>" || !client.lastReset {
+		t.Fatalf("query did not preserve pattern/reset: %q %v", client.lastPattern, client.lastReset)
+	}
+}
+
+func TestGetInboundStatsAggregatesDirections(t *testing.T) {
+	client := &fakeStatsClient{stats: []coreapi.Stat{
+		{Name: "inbound>>>edge>>>traffic>>>uplink", Value: 11},
+		{Name: "inbound>>>edge>>>traffic>>>downlink", Value: 22},
+	}}
+	manager := &Manager{state: state.New("test"), xrayStats: client}
+	response := manager.GetInboundStats(context.Background(), GetTagStatsRequest{Tag: "edge"})
+	item := response["response"].(map[string]any)
+	if item["uplink"] != int64(11) || item["downlink"] != int64(22) {
+		t.Fatalf("unexpected inbound stats: %#v", item)
+	}
+}
+
+func TestVisionRuleTagMatchesNodeObjectHash(t *testing.T) {
+	if got, want := visionRuleTag("1.2.3.4"), "0af2996736a0258868c61eb7f5151216"; got != want {
+		t.Fatalf("vision rule tag = %q, want %q", got, want)
+	}
+}
 
 func TestAddSingBoxUserSupportsAnyTLSHy2AndTUIC(t *testing.T) {
 	config := map[string]any{
@@ -55,6 +145,29 @@ func TestAddSingBoxUserSupportsAnyTLSHy2AndTUIC(t *testing.T) {
 	}
 	if got := stringValue(tuicUsers[0]["password"]); got != "trojan-password" {
 		t.Fatalf("unexpected tuic password: %s", got)
+	}
+}
+
+func TestApplyAddUserRequestKeepsAllRequestedInbounds(t *testing.T) {
+	runtimeState := state.New("test")
+	runtimeState.SetXrayConfig(map[string]any{"inbounds": []any{
+		map[string]any{"tag": "in-a", "protocol": "vless", "settings": map[string]any{"clients": []any{}}},
+		map[string]any{"tag": "in-b", "protocol": "vless", "settings": map[string]any{"clients": []any{}}},
+	}})
+	runtimeState.SetRunningCore(state.CoreTypeXRAY)
+	manager := &Manager{state: runtimeState}
+	request := AddUserRequest{Data: []AddUserItem{
+		{Type: "vless", Tag: "in-a", Username: "user-a", UUID: "uuid-a"},
+		{Type: "vless", Tag: "in-b", Username: "user-a", UUID: "uuid-a"},
+	}}
+	if err := manager.applyAddUserRequest(request); err != nil {
+		t.Fatalf("apply add user: %v", err)
+	}
+	if got := len(runtimeState.InboundUsers("in-a")); got != 1 {
+		t.Fatalf("in-a users = %d, want 1", got)
+	}
+	if got := len(runtimeState.InboundUsers("in-b")); got != 1 {
+		t.Fatalf("in-b users = %d, want 1", got)
 	}
 }
 

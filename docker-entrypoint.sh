@@ -23,6 +23,15 @@ export SING_BOX_CONFIG_PATH="${SING_BOX_CONFIG_PATH:-/run/remnawave/sing-box.jso
 
 mkdir -p /run/remnawave /var/log/supervisor
 
+if [ -n "${CUSTOM_CORE_URL:-}" ]; then
+    echo "[Entrypoint] Installing custom Xray core from ${CUSTOM_CORE_URL}"
+    if ! wget -q -O /usr/local/bin/xray "${CUSTOM_CORE_URL}"; then
+        echo "[Entrypoint] Failed to download custom core" >&2
+        exit 1
+    fi
+    chmod +x /usr/local/bin/xray
+fi
+
 supervisord -c /etc/supervisord.conf &
 sleep 1
 

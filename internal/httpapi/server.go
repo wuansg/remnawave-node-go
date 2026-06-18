@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -22,6 +23,8 @@ import (
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	nodeapp "github.com/remnawave/remnawave-node-go/internal/node"
 )
+
+const maxRequestBodySize = int64(1 << 30)
 
 var ErrServerClosed = http.ErrServerClosed
 
@@ -66,8 +69,10 @@ func NewServer(cfg config.Config, manager *nodeapp.Manager, logger *slog.Logger)
 
 	srv.public = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.NodePort),
-		Handler:           publicMux,
+		Handler:           commonHeaders(compressResponses(publicMux)),
 		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 * 1024,
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			ClientCAs:    caPool,
@@ -75,7 +80,7 @@ func NewServer(cfg config.Config, manager *nodeapp.Manager, logger *slog.Logger)
 			MinVersion:   tls.VersionTLS12,
 		},
 	}
-	srv.internal = &http.Server{Handler: internalMux}
+	srv.internal = &http.Server{Handler: commonHeaders(internalMux), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 * 1024}
 
 	return srv, nil
 }
@@ -135,7 +140,7 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.manager.GetInboundUsers(body))
+		writeJSON(w, http.StatusOK, s.manager.GetInboundUsers(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/handler/remove-user", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.RemoveUserRequest
@@ -149,7 +154,7 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.manager.GetInboundUsersCount(body))
+		writeJSON(w, http.StatusOK, s.manager.GetInboundUsersCount(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/handler/add-users", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.AddUsersRequest
@@ -188,33 +193,49 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, s.manager.GetUserOnlineStatus(r.Context(), body))
 	}))
 	mux.HandleFunc("GET /node/stats/get-system-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.manager.GetSystemStats())
+		writeJSON(w, http.StatusOK, s.manager.GetSystemStats(r.Context()))
 	}))
 	mux.HandleFunc("POST /node/stats/get-users-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.manager.GetUsersStats())
+		var body nodeapp.GetUsersStatsRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		writeJSON(w, http.StatusOK, s.manager.GetUsersStats(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/stats/get-inbound-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetTagStatsRequest
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.manager.GetInboundStats(body))
+		writeJSON(w, http.StatusOK, s.manager.GetInboundStats(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/stats/get-outbound-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetTagStatsRequest
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.manager.GetOutboundStats(body))
+		writeJSON(w, http.StatusOK, s.manager.GetOutboundStats(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/stats/get-all-inbounds-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.manager.GetAllInboundStats())
+		var body nodeapp.GetResetRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		writeJSON(w, http.StatusOK, s.manager.GetAllInboundStats(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/stats/get-all-outbounds-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.manager.GetAllOutboundStats())
+		var body nodeapp.GetResetRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		writeJSON(w, http.StatusOK, s.manager.GetAllOutboundStats(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/stats/get-combined-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.manager.GetCombinedStats())
+		var body nodeapp.GetResetRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		writeJSON(w, http.StatusOK, s.manager.GetCombinedStats(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/stats/get-user-ip-list", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetUserIPListRequest
@@ -260,14 +281,14 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.manager.BlockIP(body))
+		writeJSON(w, http.StatusOK, s.manager.BlockIP(r.Context(), body))
 	})
 	mux.HandleFunc("POST /vision/unblock-ip", func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.VisionIPRequest
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.manager.UnblockIP(body))
+		writeJSON(w, http.StatusOK, s.manager.UnblockIP(r.Context(), body))
 	})
 }
 
@@ -326,6 +347,12 @@ func decodeJSON[T any](w http.ResponseWriter, r *http.Request, out *T) bool {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"message": "invalid JSON body"})
 		return false
 	}
+	if value, ok := any(out).(interface{ Validate() error }); ok {
+		if err := value.Validate(); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"message": err.Error()})
+			return false
+		}
+	}
 	return true
 }
 
@@ -345,14 +372,50 @@ func decodeRequestBody(r *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("unsupported content encoding: %s", encoding)
 	}
 
-	payload, err := io.ReadAll(reader)
+	payload, err := io.ReadAll(io.LimitReader(reader, maxRequestBodySize+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(payload)) > maxRequestBodySize {
+		return nil, fmt.Errorf("request body exceeds %d bytes", maxRequestBodySize)
 	}
 	if len(bytes.TrimSpace(payload)) == 0 {
 		return nil, io.EOF
 	}
 	return payload, nil
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	writer *gzip.Writer
+}
+
+func (w gzipResponseWriter) Write(payload []byte) (int, error) {
+	return w.writer.Write(payload)
+}
+
+func compressResponses(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Accept-Encoding")
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		writer := gzip.NewWriter(w)
+		defer writer.Close()
+		next.ServeHTTP(gzipResponseWriter{ResponseWriter: w, writer: writer}, r)
+	})
+}
+
+func commonHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

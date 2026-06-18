@@ -1,11 +1,13 @@
 FROM golang:1.26.4-alpine AS go-build
 
 ARG REMNAWAVE_NODE_VERSION=2.7.0
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 WORKDIR /src
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags "-X github.com/remnawave/remnawave-node-go/internal/config.buildVersion=${REMNAWAVE_NODE_VERSION}" \
     -o /out/remnawave-node-go ./cmd/remnawave-node-go
 
@@ -36,7 +38,7 @@ RUN apk add --no-cache git build-base patch \
 FROM alpine:3.22
 
 LABEL org.opencontainers.image.title="Remnawave Node Go"
-LABEL org.opencontainers.image.description="Experimental Go-based Remnawave Node"
+LABEL org.opencontainers.image.description="Go-based Remnawave Node with Xray and Sing-box support"
 LABEL org.opencontainers.image.url="https://github.com/remnawave/remnawave-node-go"
 LABEL org.opencontainers.image.source="https://github.com/remnawave/remnawave-node-go"
 LABEL org.opencontainers.image.vendor="Remnawave"
@@ -56,7 +58,12 @@ COPY supervisord.conf /etc/supervisord.conf
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
-    && ln -s /usr/local/bin/xray /usr/local/bin/rw-core
+	&& ln -s /usr/local/bin/xray /usr/local/bin/rw-core \
+	&& printf '#!/bin/sh\ntail -n +1 -f /var/log/supervisor/xray.out.log\n' > /usr/local/bin/xlogs \
+	&& printf '#!/bin/sh\ntail -n +1 -f /var/log/supervisor/xray.err.log\n' > /usr/local/bin/xerrors \
+	&& printf '#!/bin/sh\ntail -n +1 -f /var/log/supervisor/sing-box.out.log\n' > /usr/local/bin/sblogs \
+	&& printf '#!/bin/sh\ntail -n +1 -f /var/log/supervisor/sing-box.err.log\n' > /usr/local/bin/sberrors \
+	&& chmod +x /usr/local/bin/xlogs /usr/local/bin/xerrors /usr/local/bin/sblogs /usr/local/bin/sberrors
 
 ENV NODE_PORT=2222
 ENV XTLS_API_PORT=61000

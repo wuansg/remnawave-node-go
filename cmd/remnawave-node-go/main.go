@@ -29,7 +29,12 @@ func main() {
 	runtimeState := state.New(cfg.NodeVersion)
 	networkMonitor := system.NewNetworkMonitor(logger)
 	supervisorClient := supervisor.New(cfg.SupervisordSocket, cfg.SupervisordUser, cfg.SupervisordPass)
-	manager := nodeapp.NewManager(cfg, runtimeState, logger, supervisorClient, networkMonitor)
+	manager, err := nodeapp.NewManager(cfg, runtimeState, logger, supervisorClient, networkMonitor)
+	if err != nil {
+		logger.Error("failed to initialize core API clients", "error", err)
+		os.Exit(1)
+	}
+	defer manager.Close()
 	manager.SyncEnvironment(context.Background())
 
 	server, err := httpapi.NewServer(cfg, manager, logger)
@@ -51,7 +56,7 @@ func main() {
 	go func() {
 		for range ticker.C {
 			networkMonitor.Tick()
-			manager.SyncEnvironment(context.Background())
+			manager.SyncProcessStatus(context.Background())
 		}
 	}()
 

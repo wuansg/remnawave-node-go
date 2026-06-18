@@ -120,7 +120,7 @@ func TestApplyXrayAPIConfigEnablesStatsService(t *testing.T) {
 		},
 	}
 
-	out := applyXrayAPIConfig(config, cfgpkg.Config{XtlsAPIPort: 61000}, emptyPluginState())
+	out := applyXrayAPIConfig(config, cfgpkg.Config{XtlsAPIPort: 61000}, emptyPluginState(), nil)
 
 	api := ensureConfigMap(out["api"])
 	if stringValue(api["tag"]) != xrayAPITag {
@@ -231,6 +231,44 @@ func TestApplySingBoxAPIConfigEnablesClashAPI(t *testing.T) {
 	}
 	if stringValue(clashAPI["secret"]) != "test-secret" {
 		t.Fatalf("expected sing-box clash api secret to be set, got %#v", clashAPI)
+	}
+	v2rayAPI := ensureConfigMap(experimental["v2ray_api"])
+	if stringValue(v2rayAPI["listen"]) != "127.0.0.1:61001" {
+		t.Fatalf("unexpected sing-box v2ray api address: %#v", v2rayAPI)
+	}
+}
+
+func TestApplyXrayAPIConfigBuildsTorrentBlockerRules(t *testing.T) {
+	config := map[string]any{
+		"inbounds":  []any{map[string]any{"tag": "main", "protocol": "vless"}},
+		"outbounds": []any{},
+		"routing": map[string]any{"rules": []any{
+			map[string]any{"ruleTag": "watched", "outboundTag": "direct"},
+		}},
+	}
+	plugin := emptyPluginState()
+	plugin.TorrentEnabled = true
+	plugin.TorrentIncludeRuleTags["watched"] = struct{}{}
+	out := applyXrayAPIConfig(config, cfgpkg.Config{XtlsAPIPort: 61000, InternalSocketPath: "/run/test.sock", InternalRESTToken: "token"}, plugin, nil)
+
+	foundTorrentRule, foundWatchedWebhook := false, false
+	for _, rule := range asMapSlice(ensureConfigMap(out["routing"])["rules"]) {
+		if stringValue(rule["outboundTag"]) == torrentOutboundTag {
+			foundTorrentRule = slices.Contains(valueStrings(rule["protocol"]), "bittorrent") && ensureConfigMap(rule["webhook"])["url"] != nil
+		}
+		if stringValue(rule["ruleTag"]) == "watched" && ensureConfigMap(rule["webhook"])["url"] != nil {
+			foundWatchedWebhook = true
+		}
+	}
+	if !foundTorrentRule || !foundWatchedWebhook {
+		t.Fatalf("torrent blocker rules incomplete: %#v", ensureConfigMap(out["routing"])["rules"])
+	}
+	foundOutbound := false
+	for _, outbound := range asMapSlice(out["outbounds"]) {
+		foundOutbound = foundOutbound || stringValue(outbound["tag"]) == torrentOutboundTag
+	}
+	if !foundOutbound {
+		t.Fatalf("torrent blocker outbound missing: %#v", out["outbounds"])
 	}
 }
 

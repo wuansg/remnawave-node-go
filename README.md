@@ -1,25 +1,21 @@
 # Remnawave Node Go
 
-Experimental Go rewrite of Remnawave Node.
+Go implementation of Remnawave Node, compatible with the Remnawave Node 2.7 API and supporting Xray and Sing-box cores.
 
-This repository is intentionally separate from the current TypeScript/NestJS node. The first milestone keeps the public contract compatible while the xray/sing-box control plane is migrated behind small adapters.
+The public HTTPS API requires mTLS and RS256 JWT authentication. Core-local APIs are bound to loopback; Xray uses ephemeral mTLS credentials and Sing-box exposes V2Ray statistics plus an authenticated Clash API.
 
-## Implemented
+## Features
 
 - Parses the existing `SECRET_KEY` base64 JSON payload.
 - Starts HTTPS with node certificate, node key, CA, and required client certificates.
 - Verifies `Authorization: Bearer ...` JWTs signed with the payload `jwtPublicKey` using `RS256`.
-- Registers the existing Remnawave routes under `/node/...`.
+- Implements the existing Remnawave routes under `/node/...`.
 - Serves internal xray config and webhook paths on `INTERNAL_SOCKET_PATH`.
-- Keeps runtime xray config in memory for `/internal/get-config`.
-- Provides a baseline `/node/xray/healthcheck` response.
-
-## Not Implemented Yet
-
-- xray-core gRPC handler and stats operations.
-- sing-box stats and process control.
-- nftables/plugin behavior.
-- supervisord XML-RPC calls beyond adapter scaffolding.
+- Provides native Xray Stats, Handler, and Routing gRPC clients.
+- Provides Xray and Sing-box traffic, system, online-user, and online-IP statistics.
+- Supports dynamic Xray users and restart-based Sing-box users, including AnyTLS, Hysteria2, and TUIC.
+- Supports Vision routing, connection dropping, torrent blocking, ingress/egress filters, and IPv4/IPv6 nftables sets.
+- Accepts plain and zstd-compressed request bodies and gzip-compresses responses.
 
 ## Run
 
@@ -31,4 +27,11 @@ INTERNAL_REST_TOKEN=... \
 go run ./cmd/remnawave-node-go
 ```
 
-The local environment used to create this repository did not have Go installed, so build/test verification still needs to run on a machine with a Go toolchain.
+For container deployment, use the supplied Compose file. Network plugins require `CAP_NET_ADMIN`, which the Compose configuration enables.
+
+Run verification with:
+
+```sh
+go test -race ./...
+go vet ./...
+```
