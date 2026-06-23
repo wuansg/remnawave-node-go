@@ -1026,8 +1026,40 @@ func (m *Manager) readVersion(ctx context.Context, binary string, args ...string
 	if len(lines) == 0 || lines[0] == "" {
 		return nil
 	}
-	version := strings.TrimSpace(lines[0])
+	version := formatCoreVersion(binary, lines[0])
 	return &version
+}
+
+func formatCoreVersion(binary, line string) string {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) == 0 {
+		return ""
+	}
+
+	name := filepath.Base(binary)
+	switch name {
+	case "xray", "rw-core":
+		if len(fields) >= 2 && strings.EqualFold(fields[0], "xray") {
+			return trimVersionPrefix(fields[1])
+		}
+	case "sing-box":
+		if len(fields) >= 3 && strings.EqualFold(fields[0], "sing-box") && strings.EqualFold(fields[1], "version") {
+			version := trimVersionPrefix(fields[2])
+			if version == "unknown" {
+				if fallback := trimVersionPrefix(os.Getenv("SING_BOX_VERSION")); fallback != "" {
+					return fallback
+				}
+			}
+			return version
+		}
+	}
+
+	return strings.TrimSpace(line)
+}
+
+func trimVersionPrefix(value string) string {
+	value = strings.TrimSpace(value)
+	return strings.TrimPrefix(value, "v")
 }
 
 func (m *Manager) applyAddUserRequest(request AddUserRequest) error {
@@ -1531,6 +1563,8 @@ func applySingBoxAPIConfig(config map[string]any, cfg config.Config) map[string]
 	clashAPI["external_controller"] = fmt.Sprintf("127.0.0.1:%d", cfg.SingBoxAPIPort)
 	if cfg.InternalRESTToken != "" {
 		clashAPI["secret"] = cfg.InternalRESTToken
+	} else {
+		delete(clashAPI, "secret")
 	}
 	experimental["clash_api"] = clashAPI
 	config["experimental"] = experimental

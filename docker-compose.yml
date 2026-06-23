@@ -16,6 +16,7 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       XTLS_API_PORT: ${XTLS_API_PORT}
       SING_BOX_API_PORT: ${SING_BOX_API_PORT}
+      INTERNAL_REST_TOKEN: ${INTERNAL_REST_TOKEN:-}
       INTERNAL_SOCKET_PATH: ${INTERNAL_SOCKET_PATH:-/run/remnawave/internal.sock}
       SUPERVISORD_SOCKET_PATH: ${SUPERVISORD_SOCKET_PATH:-/run/remnawave/supervisord.sock}
       SUPERVISORD_PID_PATH: ${SUPERVISORD_PID_PATH:-/run/remnawave/supervisord.pid}

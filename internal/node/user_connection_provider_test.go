@@ -239,6 +239,22 @@ func TestApplySingBoxAPIConfigEnablesClashAPI(t *testing.T) {
 	}
 }
 
+func TestApplySingBoxAPIConfigRemovesUnmanagedClashAPISecret(t *testing.T) {
+	config := map[string]any{
+		"experimental": map[string]any{
+			"clash_api": map[string]any{"secret": "panel-secret"},
+		},
+	}
+
+	out := applySingBoxAPIConfig(config, cfgpkg.Config{SingBoxAPIPort: 61001})
+
+	experimental := ensureConfigMap(out["experimental"])
+	clashAPI := ensureConfigMap(experimental["clash_api"])
+	if _, ok := clashAPI["secret"]; ok {
+		t.Fatalf("expected unmanaged sing-box clash api secret to be removed, got %#v", clashAPI)
+	}
+}
+
 func TestApplyXrayAPIConfigBuildsTorrentBlockerRules(t *testing.T) {
 	config := map[string]any{
 		"inbounds":  []any{map[string]any{"tag": "main", "protocol": "vless"}},

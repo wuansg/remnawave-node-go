@@ -37,6 +37,8 @@ RUN apk add --no-cache git build-base patch \
 
 FROM alpine:3.22
 
+ARG SING_BOX_VERSION=v1.13.13
+
 LABEL org.opencontainers.image.title="Remnawave Node Go"
 LABEL org.opencontainers.image.description="Go-based Remnawave Node with Xray and Sing-box support"
 LABEL org.opencontainers.image.url="https://github.com/remnawave/remnawave-node-go"
@@ -69,6 +71,7 @@ ENV NODE_PORT=2222
 ENV XTLS_API_PORT=61000
 ENV SING_BOX_API_PORT=61001
 ENV SING_BOX_V2RAY_API_PORT=61002
+ENV SING_BOX_VERSION=${SING_BOX_VERSION}
 ENV XRAY_CONFIG_PATH=/run/remnawave/xray.json
 ENV SING_BOX_CONFIG_PATH=/run/remnawave/sing-box.json
 

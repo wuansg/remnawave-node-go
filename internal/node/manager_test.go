@@ -65,6 +65,44 @@ func TestShouldRestartCoreIncludesCoreStatusAndConfiguration(t *testing.T) {
 	}
 }
 
+func TestFormatCoreVersion(t *testing.T) {
+	t.Setenv("SING_BOX_VERSION", "v1.13.13")
+
+	tests := []struct {
+		name   string
+		binary string
+		line   string
+		want   string
+	}{
+		{
+			name:   "xray long version",
+			binary: "/usr/local/bin/xray",
+			line:   "Xray 26.3.27 (Xray, Penetrates Everything.) d2758a0 (go1.26.1 linux/amd64)",
+			want:   "26.3.27",
+		},
+		{
+			name:   "sing-box explicit version",
+			binary: "/usr/local/bin/sing-box",
+			line:   "sing-box version 1.13.13",
+			want:   "1.13.13",
+		},
+		{
+			name:   "sing-box fallback version",
+			binary: "/usr/local/bin/sing-box",
+			line:   "sing-box version unknown",
+			want:   "1.13.13",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatCoreVersion(tt.binary, tt.line); got != tt.want {
+				t.Fatalf("formatCoreVersion() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetUsersStatsUsesCoreStatsAndReset(t *testing.T) {
 	client := &fakeStatsClient{stats: []coreapi.Stat{
 		{Name: "user>>>user-a>>>traffic>>>uplink", Value: 10},
