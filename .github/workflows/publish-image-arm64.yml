@@ -48,14 +48,11 @@ jobs:
           fi
 
           image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          {
-            echo "tags<<EOF"
-            echo "${image}:${tag}"
-            if [ "${GITHUB_REF_NAME}" = "${GITHUB_DEFAULT_BRANCH}" ]; then
-              echo "${image}:main-arm64"
-            fi
-            echo "EOF"
-          } >> "${GITHUB_OUTPUT}"
+          tags="${image}:${tag}"
+          if [ "${GITHUB_REF_NAME}" = "${GITHUB_DEFAULT_BRANCH}" ]; then
+            tags="${tags},${image}:main-arm64"
+          fi
+          echo "tags=${tags}" >> "${GITHUB_OUTPUT}"
 
       - name: Build and push arm64
         uses: docker/build-push-action@v6
