@@ -1,4 +1,4 @@
-FROM golang:1.26.4-alpine AS go-build
+FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
 ARG REMNAWAVE_NODE_VERSION=2.7.0
 ARG TARGETOS=linux
@@ -12,27 +12,45 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     -o /out/remnawave-node-go ./cmd/remnawave-node-go
 
 
-FROM alpine:3.22 AS xray-build
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS xray-build
 
 ARG XRAY_CORE_VERSION=v26.3.27
 ARG UPSTREAM_REPO=XTLS
-ARG XRAY_CORE_INSTALL_SCRIPT=https://raw.githubusercontent.com/remnawave/scripts/main/scripts/install-xray.sh
+ARG TARGETARCH=amd64
 
 RUN apk add --no-cache curl unzip \
-    && curl -L ${XRAY_CORE_INSTALL_SCRIPT} | sh -s -- ${XRAY_CORE_VERSION} ${UPSTREAM_REPO}
+    && case "${TARGETARCH}" in \
+        amd64) XRAY_ARCH=64 ;; \
+        arm64) XRAY_ARCH=arm64-v8a ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && if [ "${XRAY_CORE_VERSION}" = "latest" ]; then \
+        XRAY_URL="https://github.com/${UPSTREAM_REPO}/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip"; \
+    else \
+        XRAY_URL="https://github.com/${UPSTREAM_REPO}/Xray-core/releases/download/${XRAY_CORE_VERSION}/Xray-linux-${XRAY_ARCH}.zip"; \
+    fi \
+    && curl -fL "${XRAY_URL}" -o /tmp/xray.zip \
+    && unzip -q /tmp/xray.zip -d /tmp/xray \
+    && install -m 755 /tmp/xray/xray /usr/local/bin/xray \
+    && install -d /usr/local/share/xray \
+    && install -m 644 /tmp/xray/geoip.dat /usr/local/share/xray/geoip.dat \
+    && install -m 644 /tmp/xray/geosite.dat /usr/local/share/xray/geosite.dat
 
 
-FROM golang:1.25-alpine AS sing-box-build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS sing-box-build
 
 ARG SING_BOX_VERSION=v1.13.13
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 WORKDIR /src
 COPY third_party/sing-box-patches /patches
 
-RUN apk add --no-cache git build-base patch \
+RUN apk add --no-cache git patch \
     && git clone --depth 1 --branch ${SING_BOX_VERSION} https://github.com/SagerNet/sing-box.git . \
     && patch -p1 < /patches/0001-expose-user-in-clash-connections.patch \
-    && go build -tags "with_v2ray_api,with_clash_api,with_quic" -o /usr/local/bin/sing-box ./cmd/sing-box
+    && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+        go build -tags "with_v2ray_api,with_clash_api,with_quic" -o /usr/local/bin/sing-box ./cmd/sing-box
 
 
 FROM alpine:3.22
