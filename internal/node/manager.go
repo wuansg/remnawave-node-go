@@ -1503,6 +1503,7 @@ func applyXrayAPIConfig(config map[string]any, cfg config.Config, pluginState st
 	if len(config) == 0 {
 		return config
 	}
+	encodeXrayConfigUsers(config)
 	apiTag := ensureXrayStatsConfig(config, cfg.XtlsAPIPort, bundle)
 	routing := ensureMap(config, "routing")
 	rules := ensureSliceMap(routing, "rules")
@@ -1654,6 +1655,7 @@ func applySingBoxAPIConfig(config map[string]any, cfg config.Config) map[string]
 	if len(config) == 0 || cfg.SingBoxAPIPort <= 0 {
 		return config
 	}
+	encodeSingBoxConfigUsers(config)
 
 	experimental := ensureMap(config, "experimental")
 	statsInbounds := []string{}
@@ -1693,6 +1695,44 @@ func applySingBoxAPIConfig(config map[string]any, cfg config.Config) map[string]
 	experimental["clash_api"] = clashAPI
 	config["experimental"] = experimental
 	return config
+}
+
+func encodeXrayConfigUsers(config map[string]any) {
+	for _, inbound := range asMapSlice(config["inbounds"]) {
+		tag := stringValue(inbound["tag"])
+		if tag == "" || tag == xrayAPIInboundTag {
+			continue
+		}
+		settings := ensureMap(inbound, "settings")
+		clients := asMapSlice(settings["clients"])
+		for _, client := range clients {
+			userID := statname.UserID(firstNonEmpty(stringValue(client["email"]), stringValue(client["name"])))
+			if userID == "" {
+				continue
+			}
+			client["email"] = statname.UserInbound(userID, tag)
+		}
+		settings["clients"] = toAnySlice(clients)
+		inbound["settings"] = settings
+	}
+}
+
+func encodeSingBoxConfigUsers(config map[string]any) {
+	for _, inbound := range asMapSlice(config["inbounds"]) {
+		tag := stringValue(inbound["tag"])
+		if tag == "" {
+			continue
+		}
+		users := asMapSlice(inbound["users"])
+		for _, user := range users {
+			userID := statname.UserID(firstNonEmpty(stringValue(user["name"]), stringValue(user["email"])))
+			if userID == "" {
+				continue
+			}
+			user["name"] = statname.UserInbound(userID, tag)
+		}
+		inbound["users"] = toAnySlice(users)
+	}
 }
 
 func singBoxV2RayAPIPort(cfg config.Config) int {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"slices"
 	"testing"
 	"time"
 
@@ -261,6 +262,74 @@ func TestApplyAddUserRequestKeepsAllRequestedInbounds(t *testing.T) {
 	}
 	if got := runtimeState.InboundUsers("in-a")[0].UserID; got != "user-a" {
 		t.Fatalf("runtime inbound user should expose real user id, got %q", got)
+	}
+}
+
+func TestApplySingBoxAPIConfigEncodesUsersForStats(t *testing.T) {
+	rawConfig := map[string]any{
+		"inbounds": []any{
+			map[string]any{
+				"tag":  "in-a",
+				"type": "anytls",
+				"users": []any{
+					map[string]any{"name": "2", "password": "password-a"},
+					map[string]any{"name": statname.UserInbound("3", "in-a"), "password": "password-b"},
+				},
+			},
+		},
+		"outbounds": []any{
+			map[string]any{"tag": "direct", "type": "direct"},
+		},
+	}
+
+	encoded := applySingBoxAPIConfig(rawConfig, config.Config{SingBoxAPIPort: 61001, SingBoxV2RayAPIPort: 61002})
+	users := asMapSlice(asMapSlice(encoded["inbounds"])[0]["users"])
+	if got, want := stringValue(users[0]["name"]), statname.UserInbound("2", "in-a"); got != want {
+		t.Fatalf("sing-box user name = %q, want %q", got, want)
+	}
+	if got, want := stringValue(users[1]["name"]), statname.UserInbound("3", "in-a"); got != want {
+		t.Fatalf("pre-encoded sing-box user name = %q, want %q", got, want)
+	}
+
+	experimental := encoded["experimental"].(map[string]any)
+	v2rayAPI := experimental["v2ray_api"].(map[string]any)
+	stats := v2rayAPI["stats"].(map[string]any)
+	statsUsers := valueStrings(stats["users"])
+	if !slices.Contains(statsUsers, statname.UserInbound("2", "in-a")) {
+		t.Fatalf("stats users should contain encoded user, got %#v", statsUsers)
+	}
+}
+
+func TestApplyXrayAPIConfigEncodesUsersForStats(t *testing.T) {
+	rawConfig := map[string]any{
+		"inbounds": []any{
+			map[string]any{
+				"tag":      "in-a",
+				"protocol": "vless",
+				"settings": map[string]any{
+					"clients": []any{
+						map[string]any{"email": "2", "id": "uuid-a"},
+					},
+				},
+			},
+		},
+	}
+
+	encoded := applyXrayAPIConfig(rawConfig, config.Config{XtlsAPIPort: 61000}, state.PluginState{}, nil)
+	var targetInbound map[string]any
+	for _, inbound := range asMapSlice(encoded["inbounds"]) {
+		if stringValue(inbound["tag"]) == "in-a" {
+			targetInbound = inbound
+			break
+		}
+	}
+	if targetInbound == nil {
+		t.Fatal("in-a inbound not found")
+	}
+	settings := targetInbound["settings"].(map[string]any)
+	clients := asMapSlice(settings["clients"])
+	if got, want := stringValue(clients[0]["email"]), statname.UserInbound("2", "in-a"); got != want {
+		t.Fatalf("xray client email = %q, want %q", got, want)
 	}
 }
 
