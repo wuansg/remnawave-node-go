@@ -1,8 +1,8 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
 ARG REMNAWAVE_NODE_VERSION=2.7.0
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 COPY . .
@@ -16,7 +16,7 @@ FROM --platform=$BUILDPLATFORM alpine:3.22 AS xray-build
 
 ARG XRAY_CORE_VERSION=v26.3.27
 ARG UPSTREAM_REPO=XTLS
-ARG TARGETARCH=amd64
+ARG TARGETARCH
 
 RUN apk add --no-cache curl unzip \
     && case "${TARGETARCH}" in \
@@ -40,8 +40,8 @@ RUN apk add --no-cache curl unzip \
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS sing-box-build
 
 ARG SING_BOX_VERSION=v1.13.13
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 COPY third_party/sing-box-patches /patches
