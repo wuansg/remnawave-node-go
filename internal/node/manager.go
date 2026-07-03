@@ -21,6 +21,7 @@ import (
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	"github.com/remnawave/remnawave-node-go/internal/coreapi"
 	"github.com/remnawave/remnawave-node-go/internal/state"
+	"github.com/remnawave/remnawave-node-go/internal/statname"
 	"github.com/remnawave/remnawave-node-go/internal/supervisor"
 	"github.com/remnawave/remnawave-node-go/internal/system"
 	"google.golang.org/grpc/credentials/insecure"
@@ -157,6 +158,10 @@ type GetUserOnlineStatusRequest struct {
 }
 
 type GetUsersStatsRequest struct {
+	Reset bool `json:"reset"`
+}
+
+type GetUsersInboundStatsRequest struct {
 	Reset bool `json:"reset"`
 }
 
@@ -434,11 +439,13 @@ func (m *Manager) GetSystemStats(ctx context.Context) map[string]any {
 
 func (m *Manager) GetUserOnlineStatus(ctx context.Context, request GetUserOnlineStatusRequest) map[string]any {
 	if m.state.RunningCoreType() != state.CoreTypeSingBox && m.xrayStats != nil {
-		online, err := m.xrayStats.Online(ctx, request.Username)
-		if err != nil {
-			online = false
+		for _, username := range m.statUsernamesForUser(request.Username) {
+			online, err := m.xrayStats.Online(ctx, username)
+			if err == nil && online {
+				return map[string]any{"response": map[string]any{"isOnline": true}}
+			}
 		}
-		return map[string]any{"response": map[string]any{"isOnline": online}}
+		return map[string]any{"response": map[string]any{"isOnline": false}}
 	}
 	online, err := m.userConnectionProvider().UserOnlineStatus(ctx, request.Username)
 	if err != nil {
@@ -448,15 +455,37 @@ func (m *Manager) GetUserOnlineStatus(ctx context.Context, request GetUserOnline
 }
 
 func (m *Manager) GetUsersStats(ctx context.Context, request GetUsersStatsRequest) map[string]any {
-	users := m.queryGroupedStats(ctx, "user", "user>>>", request.Reset)
+	userInboundStats := m.queryUserInboundStats(ctx, request.Reset)
+	grouped := map[string]map[string]any{}
+	for _, user := range userInboundStats {
+		username := user["username"].(string)
+		item := grouped[username]
+		if item == nil {
+			item = map[string]any{"username": username, "uplink": int64(0), "downlink": int64(0)}
+			grouped[username] = item
+		}
+		item["uplink"] = item["uplink"].(int64) + user["uplink"].(int64)
+		item["downlink"] = item["downlink"].(int64) + user["downlink"].(int64)
+	}
+	users := make([]map[string]any, 0, len(grouped))
+	for _, user := range grouped {
+		if user["uplink"].(int64) != 0 || user["downlink"].(int64) != 0 {
+			users = append(users, user)
+		}
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i]["username"].(string) < users[j]["username"].(string) })
+	return map[string]any{"response": map[string]any{"users": users}}
+}
+
+func (m *Manager) GetUsersInboundStats(ctx context.Context, request GetUsersInboundStatsRequest) map[string]any {
+	users := m.queryUserInboundStats(ctx, request.Reset)
 	filtered := users[:0]
 	for _, user := range users {
 		if user["uplink"].(int64) != 0 || user["downlink"].(int64) != 0 {
 			filtered = append(filtered, user)
 		}
 	}
-	users = filtered
-	return map[string]any{"response": map[string]any{"users": users}}
+	return map[string]any{"response": map[string]any{"users": filtered}}
 }
 
 func (m *Manager) GetInboundStats(ctx context.Context, request GetTagStatsRequest) map[string]any {
@@ -541,6 +570,73 @@ func (m *Manager) queryGroupedStats(ctx context.Context, kind, pattern string, r
 	return items
 }
 
+func (m *Manager) queryUserInboundStats(ctx context.Context, reset bool) []map[string]any {
+	client := m.statsClient()
+	if client == nil {
+		return []map[string]any{}
+	}
+
+	stats, err := client.Query(ctx, "user>>>", reset)
+	if err != nil {
+		m.logger.Warn("failed to query core user traffic stats", "error", err)
+		return []map[string]any{}
+	}
+
+	grouped := map[string]map[string]any{}
+	prefix := "user>>>"
+	marker := ">>>traffic>>>"
+	for _, stat := range stats {
+		if !strings.HasPrefix(stat.Name, prefix) {
+			continue
+		}
+
+		remainder := strings.TrimPrefix(stat.Name, prefix)
+		idx := strings.LastIndex(remainder, marker)
+		if idx <= 0 {
+			continue
+		}
+
+		rawUsername, direction := remainder[:idx], remainder[idx+len(marker):]
+		if direction != "uplink" && direction != "downlink" {
+			continue
+		}
+
+		username, inbound, ok := statname.ParseUserInbound(rawUsername)
+		if !ok {
+			username = rawUsername
+			inbound = ""
+		}
+
+		key := username + "\x00" + inbound
+		item := grouped[key]
+		if item == nil {
+			item = map[string]any{
+				"username": username,
+				"inbound":  inbound,
+				"uplink":   int64(0),
+				"downlink": int64(0),
+			}
+			grouped[key] = item
+		}
+		item[direction] = item[direction].(int64) + stat.Value
+	}
+
+	items := make([]map[string]any, 0, len(grouped))
+	for _, item := range grouped {
+		items = append(items, item)
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		leftUser, rightUser := items[i]["username"].(string), items[j]["username"].(string)
+		if leftUser != rightUser {
+			return leftUser < rightUser
+		}
+		return items[i]["inbound"].(string) < items[j]["inbound"].(string)
+	})
+
+	return items
+}
+
 func findTagStats(items []map[string]any, kind, tag string) map[string]any {
 	for _, item := range items {
 		if item[kind] == tag {
@@ -552,14 +648,7 @@ func findTagStats(items []map[string]any, kind, tag string) map[string]any {
 
 func (m *Manager) GetUserIPList(ctx context.Context, request GetUserIPListRequest) map[string]any {
 	if m.state.RunningCoreType() != state.CoreTypeSingBox && m.xrayStats != nil {
-		ips, err := m.xrayStats.UserIPs(ctx, request.UserID)
-		if err != nil {
-			return map[string]any{"response": map[string]any{"ips": []map[string]any{}}}
-		}
-		items := make([]state.SeenIP, 0, len(ips))
-		for ip, seen := range ips {
-			items = append(items, state.SeenIP{IP: ip, LastSeen: time.Unix(seen, 0)})
-		}
+		items := m.xrayUserIPs(ctx, request.UserID)
 		sort.Slice(items, func(i, j int) bool { return items[i].LastSeen.After(items[j].LastSeen) })
 		return map[string]any{"response": map[string]any{"ips": formatSeenIPs(items)}}
 	}
@@ -579,12 +668,15 @@ func (m *Manager) GetUsersIPList(ctx context.Context) map[string]any {
 		all := make(map[string][]state.SeenIP, len(users))
 		for _, userID := range users {
 			ips, err := m.xrayStats.UserIPs(ctx, userID)
+			realUserID := statname.UserID(userID)
 			if err != nil {
-				all[userID] = []state.SeenIP{}
+				if _, ok := all[realUserID]; !ok {
+					all[realUserID] = []state.SeenIP{}
+				}
 				continue
 			}
 			for ip, seen := range ips {
-				all[userID] = append(all[userID], state.SeenIP{IP: ip, LastSeen: time.Unix(seen, 0)})
+				all[realUserID] = append(all[realUserID], state.SeenIP{IP: ip, LastSeen: time.Unix(seen, 0)})
 			}
 		}
 		return map[string]any{"response": map[string]any{"users": formatUserIPLists(all)}}
@@ -602,7 +694,7 @@ func (m *Manager) GetInboundUsers(ctx context.Context, request GetInboundUsersRe
 		if err == nil {
 			items := make([]map[string]any, 0, len(users))
 			for _, user := range users {
-				items = append(items, map[string]any{"username": user.Username, "level": user.Level, "protocol": user.Protocol})
+				items = append(items, map[string]any{"username": statname.UserID(user.Username), "level": user.Level, "protocol": user.Protocol})
 			}
 			return map[string]any{"response": map[string]any{"users": items}}
 		}
@@ -1085,8 +1177,9 @@ func (m *Manager) addXrayUsersLive(ctx context.Context, users []AddUserItem) err
 			_ = m.removeXrayUserLive(ctx, user.Username)
 			seen[user.Username] = struct{}{}
 		}
+		statsUsername := statname.UserInbound(user.Username, user.Tag)
 		if err := m.xrayHandle.AddUser(ctx, user.Tag, coreapi.User{
-			Type: user.Type, Username: user.Username, Password: user.Password, UUID: user.UUID,
+			Type: user.Type, Username: statsUsername, Password: user.Password, UUID: user.UUID,
 			Flow: user.Flow, CipherType: user.CipherType, IVCheck: user.IVCheck,
 		}); err != nil {
 			return fmt.Errorf("add Xray user %s to %s: %w", user.Username, user.Tag, err)
@@ -1109,8 +1202,9 @@ func (m *Manager) addBulkXrayUsersLive(ctx context.Context, request AddUsersRequ
 			if inbound.Type == "hysteria" {
 				password = user.UserData.VLESSUUID
 			}
+			statsUsername := statname.UserInbound(user.UserData.UserID, inbound.Tag)
 			if err := m.xrayHandle.AddUser(ctx, inbound.Tag, coreapi.User{
-				Type: inbound.Type, Username: user.UserData.UserID, Password: password,
+				Type: inbound.Type, Username: statsUsername, Password: password,
 				UUID: user.UserData.VLESSUUID, Flow: inbound.Flow,
 			}); err != nil {
 				return fmt.Errorf("add Xray user %s to %s: %w", user.UserData.UserID, inbound.Tag, err)
@@ -1125,10 +1219,12 @@ func (m *Manager) removeXrayUserLive(ctx context.Context, username string) error
 	var lastErr error
 	succeeded := 0
 	for _, tag := range tags {
-		if err := m.xrayHandle.RemoveUser(ctx, tag, username); err != nil {
-			lastErr = err
-		} else {
-			succeeded++
+		for _, statsUsername := range []string{username, statname.UserInbound(username, tag)} {
+			if err := m.xrayHandle.RemoveUser(ctx, tag, statsUsername); err != nil {
+				lastErr = err
+			} else {
+				succeeded++
+			}
 		}
 	}
 	if len(tags) > 0 && succeeded == 0 {
@@ -1141,15 +1237,43 @@ func (m *Manager) xrayUserIPs(ctx context.Context, username string) []state.Seen
 	if m.xrayStats == nil {
 		return nil
 	}
-	values, err := m.xrayStats.UserIPs(ctx, username)
-	if err != nil {
-		return nil
+	seenByIP := map[string]time.Time{}
+	for _, statsUsername := range m.statUsernamesForUser(username) {
+		values, err := m.xrayStats.UserIPs(ctx, statsUsername)
+		if err != nil {
+			continue
+		}
+		for ip, seen := range values {
+			lastSeen := time.Unix(seen, 0)
+			if previous, ok := seenByIP[ip]; !ok || lastSeen.After(previous) {
+				seenByIP[ip] = lastSeen
+			}
+		}
 	}
-	items := make([]state.SeenIP, 0, len(values))
-	for ip, seen := range values {
-		items = append(items, state.SeenIP{IP: ip, LastSeen: time.Unix(seen, 0)})
+	items := make([]state.SeenIP, 0, len(seenByIP))
+	for ip, seen := range seenByIP {
+		items = append(items, state.SeenIP{IP: ip, LastSeen: seen})
 	}
 	return items
+}
+
+func (m *Manager) statUsernamesForUser(username string) []string {
+	values := []string{username}
+	seen := map[string]struct{}{username: {}}
+	for tag, users := range m.state.InboundUsersMap() {
+		for _, user := range users {
+			if user.UserID != username {
+				continue
+			}
+			statsUsername := statname.UserInbound(username, tag)
+			if _, ok := seen[statsUsername]; ok {
+				continue
+			}
+			values = append(values, statsUsername)
+			seen[statsUsername] = struct{}{}
+		}
+	}
+	return values
 }
 
 func xrayInboundTags(config map[string]any) []string {
@@ -1585,7 +1709,7 @@ func addXrayUser(config map[string]any, item AddUserItem) error {
 		}
 		settings := ensureMap(inbound, "settings")
 		clients := ensureSliceMap(settings, "clients")
-		client := map[string]any{"email": item.Username}
+		client := map[string]any{"email": statname.UserInbound(item.Username, item.Tag)}
 		switch stringValue(inbound["protocol"]) {
 		case "trojan":
 			client["password"] = item.Password
@@ -1617,7 +1741,7 @@ func removeXrayUser(config map[string]any, username string) {
 		clients := asMapSlice(settings["clients"])
 		filtered := make([]map[string]any, 0, len(clients))
 		for _, client := range clients {
-			if firstNonEmpty(stringValue(client["email"]), stringValue(client["name"])) == username {
+			if statname.UserID(firstNonEmpty(stringValue(client["email"]), stringValue(client["name"]))) == username {
 				continue
 			}
 			filtered = append(filtered, client)
@@ -1634,7 +1758,7 @@ func addSingBoxUser(config map[string]any, item AddUserItem) error {
 		}
 		protocol := normalizeSingBoxType(stringValue(inbound["type"]))
 		users := ensureSliceMap(inbound, "users")
-		user := map[string]any{"name": item.Username}
+		user := map[string]any{"name": statname.UserInbound(item.Username, item.Tag)}
 		switch protocol {
 		case "anytls":
 			user["password"] = item.Password
@@ -1662,7 +1786,7 @@ func removeSingBoxUser(config map[string]any, username string) {
 		users := asMapSlice(inbound["users"])
 		filtered := make([]map[string]any, 0, len(users))
 		for _, user := range users {
-			if firstNonEmpty(stringValue(user["name"]), stringValue(user["email"])) == username {
+			if statname.UserID(firstNonEmpty(stringValue(user["name"]), stringValue(user["email"]))) == username {
 				continue
 			}
 			filtered = append(filtered, user)

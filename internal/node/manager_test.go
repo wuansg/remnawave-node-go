@@ -10,6 +10,7 @@ import (
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	"github.com/remnawave/remnawave-node-go/internal/coreapi"
 	"github.com/remnawave/remnawave-node-go/internal/state"
+	"github.com/remnawave/remnawave-node-go/internal/statname"
 	"github.com/remnawave/remnawave-node-go/internal/system"
 )
 
@@ -104,9 +105,10 @@ func TestFormatCoreVersion(t *testing.T) {
 }
 
 func TestGetUsersStatsUsesCoreStatsAndReset(t *testing.T) {
+	encodedUser := statname.UserInbound("user-a", "in-a")
 	client := &fakeStatsClient{stats: []coreapi.Stat{
-		{Name: "user>>>user-a>>>traffic>>>uplink", Value: 10},
-		{Name: "user>>>user-a>>>traffic>>>downlink", Value: 20},
+		{Name: "user>>>" + encodedUser + ">>>traffic>>>uplink", Value: 10},
+		{Name: "user>>>" + encodedUser + ">>>traffic>>>downlink", Value: 20},
 		{Name: "user>>>idle>>>traffic>>>uplink", Value: 0},
 	}}
 	manager := &Manager{state: state.New("test"), xrayStats: client}
@@ -117,6 +119,29 @@ func TestGetUsersStatsUsesCoreStatsAndReset(t *testing.T) {
 	}
 	if client.lastPattern != "user>>>" || !client.lastReset {
 		t.Fatalf("query did not preserve pattern/reset: %q %v", client.lastPattern, client.lastReset)
+	}
+}
+
+func TestGetUsersInboundStatsReturnsInboundDimension(t *testing.T) {
+	client := &fakeStatsClient{stats: []coreapi.Stat{
+		{Name: "user>>>" + statname.UserInbound("user-a", "in-a") + ">>>traffic>>>uplink", Value: 10},
+		{Name: "user>>>" + statname.UserInbound("user-a", "in-b") + ">>>traffic>>>downlink", Value: 20},
+		{Name: "user>>>legacy-user>>>traffic>>>uplink", Value: 30},
+	}}
+	manager := &Manager{state: state.New("test"), xrayStats: client}
+	response := manager.GetUsersInboundStats(context.Background(), GetUsersInboundStatsRequest{Reset: true})
+	users := response["response"].(map[string]any)["users"].([]map[string]any)
+	if len(users) != 3 {
+		t.Fatalf("unexpected user inbound stats: %#v", users)
+	}
+	if users[0]["username"] != "legacy-user" || users[0]["inbound"] != "" {
+		t.Fatalf("legacy stats should be preserved without an inbound: %#v", users[0])
+	}
+	if users[1]["username"] != "user-a" || users[1]["inbound"] != "in-a" || users[1]["uplink"] != int64(10) {
+		t.Fatalf("unexpected first inbound stat: %#v", users[1])
+	}
+	if users[2]["username"] != "user-a" || users[2]["inbound"] != "in-b" || users[2]["downlink"] != int64(20) {
+		t.Fatalf("unexpected second inbound stat: %#v", users[2])
 	}
 }
 
@@ -226,6 +251,16 @@ func TestApplyAddUserRequestKeepsAllRequestedInbounds(t *testing.T) {
 	}
 	if got := len(runtimeState.InboundUsers("in-b")); got != 1 {
 		t.Fatalf("in-b users = %d, want 1", got)
+	}
+	xrayConfig := runtimeState.XrayConfig()
+	inbounds := asMapSlice(xrayConfig["inbounds"])
+	firstSettings := inbounds[0]["settings"].(map[string]any)
+	firstClients := asMapSlice(firstSettings["clients"])
+	if got, want := stringValue(firstClients[0]["email"]), statname.UserInbound("user-a", "in-a"); got != want {
+		t.Fatalf("encoded xray stats username = %q, want %q", got, want)
+	}
+	if got := runtimeState.InboundUsers("in-a")[0].UserID; got != "user-a" {
+		t.Fatalf("runtime inbound user should expose real user id, got %q", got)
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/remnawave/remnawave-node-go/internal/statname"
 )
 
 type CoreType string
@@ -396,7 +398,7 @@ func extractXrayInbounds(config map[string]any, target map[string][]InboundUser,
 				continue
 			}
 			target[tag] = append(target[tag], InboundUser{
-				UserID:   userID,
+				UserID:   statname.UserID(userID),
 				Protocol: protocol,
 				Tag:      tag,
 			})
@@ -418,7 +420,7 @@ func extractSingBoxInbounds(config map[string]any, target map[string][]InboundUs
 				continue
 			}
 			target[tag] = append(target[tag], InboundUser{
-				UserID:   userID,
+				UserID:   statname.UserID(userID),
 				Protocol: protocol,
 				Tag:      tag,
 			})

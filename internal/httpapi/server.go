@@ -202,6 +202,13 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, s.manager.GetUsersStats(r.Context(), body))
 	}))
+	mux.HandleFunc("POST /node/stats/get-users-inbound-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		var body nodeapp.GetUsersInboundStatsRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		writeJSON(w, http.StatusOK, s.manager.GetUsersInboundStats(r.Context(), body))
+	}))
 	mux.HandleFunc("POST /node/stats/get-inbound-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetTagStatsRequest
 		if !decodeJSON(w, r, &body) {
