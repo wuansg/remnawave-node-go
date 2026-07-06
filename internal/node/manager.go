@@ -51,9 +51,12 @@ var (
 		"certificatePath":     "certificate_path",
 		"congestionControl":   "congestion_control",
 		"domainSuffix":        "domain_suffix",
+		"downloadDetour":      "download_detour",
+		"cacheFile":           "cache_file",
 		"ipIsPrivate":         "ip_is_private",
 		"keyPath":             "key_path",
 		"listenPort":          "listen_port",
+		"ruleSet":             "rule_set",
 		"serverPort":          "server_port",
 	}
 )
