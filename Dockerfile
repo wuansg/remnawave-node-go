@@ -39,7 +39,9 @@ RUN apk add --no-cache curl unzip \
 
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS sing-box-build
 
-ARG SING_BOX_VERSION=v1.13.13
+ARG SING_BOX_REPOSITORY=hi2shark/sing-box
+ARG SING_BOX_COMMIT=fad5e407dc6ef0c68e4f2501d146d885c28c64ad
+ARG SING_BOX_VERSION=dev-nowhere-fad5e407
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -47,15 +49,22 @@ WORKDIR /src
 COPY third_party/sing-box-patches /patches
 
 RUN apk add --no-cache git patch \
-    && git clone --depth 1 --branch ${SING_BOX_VERSION} https://github.com/SagerNet/sing-box.git . \
+    && git init . \
+    && git remote add origin https://github.com/${SING_BOX_REPOSITORY}.git \
+    && git fetch --depth 1 origin ${SING_BOX_COMMIT} \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "${SING_BOX_COMMIT}" \
     && patch -p1 < /patches/0001-expose-user-in-clash-connections.patch \
     && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-        go build -tags "with_v2ray_api,with_clash_api,with_quic" -o /usr/local/bin/sing-box ./cmd/sing-box
+        go build \
+        -tags "with_v2ray_api,with_clash_api,with_quic" \
+        -ldflags "-X github.com/sagernet/sing-box/constant.Version=${SING_BOX_VERSION}" \
+        -o /usr/local/bin/sing-box ./cmd/sing-box
 
 
 FROM alpine:3.22
 
-ARG SING_BOX_VERSION=v1.13.13
+ARG SING_BOX_VERSION=dev-nowhere-fad5e407
 
 LABEL org.opencontainers.image.title="Remnawave Node Go"
 LABEL org.opencontainers.image.description="Go-based Remnawave Node with Xray and Sing-box support"

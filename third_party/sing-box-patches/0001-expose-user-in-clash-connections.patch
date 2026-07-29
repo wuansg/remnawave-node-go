@@ -1,10 +1,4 @@
---- a/experimental/clashapi/trafficontrol/tracker.go
-+++ b/experimental/clashapi/trafficontrol/tracker.go
-@@ -67,6 +67,7 @@ func (t TrackerMetadata) MarshalJSON() ([]byte, error) {
- 			"destinationPort": F.ToString(t.Metadata.Destination.Port),
- 			"host":            domain,
- 			"dnsMode":         "normal",
-+			"user":            t.Metadata.User,
- 			"processPath":     processPath,
- 		},
- 		"upload":      t.Upload.Load(),
+--- a/experimental/clashapi/connections.go
++++ b/experimental/clashapi/connections.go
+@@ -95,0 +96 @@
++				"user":            c.Metadata.User,
