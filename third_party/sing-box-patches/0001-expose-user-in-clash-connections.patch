@@ -1,4 +1,4 @@
---- a/experimental/clashapi/connections.go
-+++ b/experimental/clashapi/connections.go
-@@ -95,0 +96 @@
-+				"user":            c.Metadata.User,
+--- a/experimental/clashapi/trafficontrol/tracker.go
++++ b/experimental/clashapi/trafficontrol/tracker.go
+@@ -77,0 +78 @@ func (t TrackerMetadata) MarshalJSON() ([]byte, error) {
++			"user":            t.Metadata.User,
