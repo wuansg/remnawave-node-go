@@ -193,7 +193,12 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, s.manager.GetUserOnlineStatus(r.Context(), body))
 	}))
 	mux.HandleFunc("GET /node/stats/get-system-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.manager.GetSystemStats(r.Context()))
+		response, err := s.manager.GetSystemStats(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"message": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, response)
 	}))
 	mux.HandleFunc("POST /node/stats/get-users-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetUsersStatsRequest

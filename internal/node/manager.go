@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -37,6 +38,8 @@ const (
 )
 
 var (
+	ErrCoreUnavailable = errors.New("core is not running or its statistics API is unavailable")
+
 	defaultIgnoredIPs = map[string]struct{}{
 		"::":              {},
 		"::1":             {},
@@ -392,38 +395,37 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 	}
 }
 
-func (m *Manager) GetSystemStats(ctx context.Context) map[string]any {
+func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {
+	runningCore := m.state.RunningCoreType()
+	xrayOnline, singBoxOnline := m.state.OnlineStatus()
+	if runningCore == "" ||
+		(runningCore == state.CoreTypeXRAY && !xrayOnline) ||
+		(runningCore == state.CoreTypeSingBox && !singBoxOnline) {
+		return nil, ErrCoreUnavailable
+	}
+
+	client := m.statsClient()
+	if client == nil {
+		return nil, ErrCoreUnavailable
+	}
+	stats, err := client.System(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCoreUnavailable, err)
+	}
+
 	snapshot := system.SystemSnapshot(m.network)
 	pluginState := m.state.PluginState()
 	coreStats := map[string]any{
-		"numGoroutine": 0,
-		"numGC":        0,
-		"alloc":        0,
-		"totalAlloc":   0,
-		"sys":          0,
-		"mallocs":      0,
-		"frees":        0,
-		"liveObjects":  0,
-		"pauseTotalNs": 0,
-		"uptime":       0,
-	}
-	if client := m.statsClient(); client != nil {
-		if stats, err := client.System(ctx); err == nil {
-			coreStats = map[string]any{
-				"numGoroutine": stats.NumGoroutine,
-				"numGC":        stats.NumGC,
-				"alloc":        stats.Alloc,
-				"totalAlloc":   stats.TotalAlloc,
-				"sys":          stats.Sys,
-				"mallocs":      stats.Mallocs,
-				"frees":        stats.Frees,
-				"liveObjects":  stats.LiveObjects,
-				"pauseTotalNs": stats.PauseTotalNs,
-				"uptime":       stats.Uptime,
-			}
-		} else {
-			m.logger.Warn("failed to query core system stats", "error", err)
-		}
+		"numGoroutine": stats.NumGoroutine,
+		"numGC":        stats.NumGC,
+		"alloc":        stats.Alloc,
+		"totalAlloc":   stats.TotalAlloc,
+		"sys":          stats.Sys,
+		"mallocs":      stats.Mallocs,
+		"frees":        stats.Frees,
+		"liveObjects":  stats.LiveObjects,
+		"pauseTotalNs": stats.PauseTotalNs,
+		"uptime":       stats.Uptime,
 	}
 	return map[string]any{
 		"response": map[string]any{
@@ -437,7 +439,7 @@ func (m *Manager) GetSystemStats(ctx context.Context) map[string]any {
 				"stats": snapshot.Stats,
 			},
 		},
-	}
+	}, nil
 }
 
 func (m *Manager) GetUserOnlineStatus(ctx context.Context, request GetUserOnlineStatusRequest) map[string]any {

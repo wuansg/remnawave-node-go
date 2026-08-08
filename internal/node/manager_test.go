@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"slices"
@@ -19,6 +20,7 @@ type fakeStatsClient struct {
 	stats       []coreapi.Stat
 	lastPattern string
 	lastReset   bool
+	systemErr   error
 }
 
 func (f *fakeStatsClient) Query(_ context.Context, pattern string, reset bool) ([]coreapi.Stat, error) {
@@ -26,7 +28,7 @@ func (f *fakeStatsClient) Query(_ context.Context, pattern string, reset bool) (
 	return f.stats, nil
 }
 func (f *fakeStatsClient) System(context.Context) (coreapi.SystemStats, error) {
-	return coreapi.SystemStats{NumGoroutine: 7, Uptime: 42}, nil
+	return coreapi.SystemStats{NumGoroutine: 7, Uptime: 42}, f.systemErr
 }
 func (f *fakeStatsClient) Online(context.Context, string) (bool, error) { return true, nil }
 func (f *fakeStatsClient) UserIPs(context.Context, string) (map[string]int64, error) {
@@ -159,20 +161,51 @@ func TestGetInboundStatsAggregatesDirections(t *testing.T) {
 	}
 }
 
-func TestGetSystemStatsAlwaysIncludesCoreInfo(t *testing.T) {
+func TestGetSystemStatsRejectsOfflineCore(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	manager := &Manager{
 		state:   state.New("test"),
 		network: system.NewNetworkMonitor(logger),
 	}
-	response := manager.GetSystemStats(context.Background())
+	if _, err := manager.GetSystemStats(context.Background()); !errors.Is(err, ErrCoreUnavailable) {
+		t.Fatalf("GetSystemStats() error = %v, want ErrCoreUnavailable", err)
+	}
+}
+
+func TestGetSystemStatsIncludesRunningCoreInfo(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeXRAY)
+	runtimeState.SetOnlineStatus(true, false)
+	manager := &Manager{
+		state:     runtimeState,
+		network:   system.NewNetworkMonitor(logger),
+		xrayStats: &fakeStatsClient{},
+	}
+	response, err := manager.GetSystemStats(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemStats() error = %v", err)
+	}
 	xrayInfo := response["response"].(map[string]any)["xrayInfo"]
 	stats, ok := xrayInfo.(map[string]any)
 	if !ok {
 		t.Fatalf("xrayInfo must be an object, got %#v", xrayInfo)
 	}
-	if stats["uptime"] != 0 || len(stats) != 10 {
-		t.Fatalf("unexpected offline core stats: %#v", stats)
+	if stats["uptime"] != uint32(42) || len(stats) != 10 {
+		t.Fatalf("unexpected running core stats: %#v", stats)
+	}
+}
+
+func TestGetSystemStatsRejectsUnavailableCoreAPI(t *testing.T) {
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.SetOnlineStatus(false, true)
+	manager := &Manager{
+		state:     runtimeState,
+		singStats: &fakeStatsClient{systemErr: errors.New("connection refused")},
+	}
+	if _, err := manager.GetSystemStats(context.Background()); !errors.Is(err, ErrCoreUnavailable) {
+		t.Fatalf("GetSystemStats() error = %v, want ErrCoreUnavailable", err)
 	}
 }
 
