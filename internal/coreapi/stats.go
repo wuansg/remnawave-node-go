@@ -11,7 +11,7 @@ import (
 
 const (
 	xrayStatsService    = "xray.app.stats.command.StatsService"
-	singBoxStatsService = "experimental.v2rayapi.StatsService"
+	singBoxStatsService = "v2ray.core.app.stats.command.StatsService"
 )
 
 type Stat struct {

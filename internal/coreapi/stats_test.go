@@ -3,7 +3,9 @@ package coreapi
 import "testing"
 
 func TestSingBoxStatsServiceMatchesUpstreamAPI(t *testing.T) {
-	if got, want := singBoxStatsService, "experimental.v2rayapi.StatsService"; got != want {
+	// sing-box keeps its protobuf package name, but overrides the registered
+	// service name to this legacy V2Ray path for client compatibility.
+	if got, want := singBoxStatsService, "v2ray.core.app.stats.command.StatsService"; got != want {
 		t.Fatalf("sing-box stats service = %q, want %q", got, want)
 	}
 }
