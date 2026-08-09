@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -315,6 +316,7 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 		if len(config) == 0 {
 			return wrapStartResponse(false, nil, ptrString("singBoxConfig is required for SING_BOX core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
 		}
+		shouldRestart = shouldRestart || !reflect.DeepEqual(m.state.SingBoxConfig(), config)
 		m.state.SetSingBoxConfig(config)
 		if shouldRestart {
 			if err := m.restartSingBox(ctx, config); err != nil {
@@ -326,6 +328,7 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 		if len(config) == 0 {
 			return wrapStartResponse(false, nil, ptrString("xrayConfig is required for XRAY core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
 		}
+		shouldRestart = shouldRestart || !reflect.DeepEqual(m.state.XrayConfig(), config)
 		m.state.SetXrayConfig(config)
 		if shouldRestart {
 			if err := m.restartXray(ctx); err != nil {

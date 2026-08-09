@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/remnawave/remnawave-node-go/internal/state"
+	"github.com/remnawave/remnawave-node-go/internal/statname"
 )
 
 var (
@@ -353,7 +354,7 @@ type singBoxConnection struct {
 
 func filterSingBoxConnectionsByUser(connections []singBoxConnection, userID string) []singBoxConnection {
 	return commonFilterSingBoxConnections(connections, func(connection singBoxConnection) bool {
-		return connection.Metadata.User == userID && connection.Metadata.SourceIP != ""
+		return statname.UserID(connection.Metadata.User) == userID && connection.Metadata.SourceIP != ""
 	})
 }
 
@@ -363,7 +364,11 @@ func groupSingBoxConnectionsByUser(connections []singBoxConnection) map[string][
 		if connection.Metadata.User == "" || connection.Metadata.SourceIP == "" {
 			continue
 		}
-		grouped[connection.Metadata.User] = append(grouped[connection.Metadata.User], connection)
+		userID := statname.UserID(connection.Metadata.User)
+		if userID == "" {
+			continue
+		}
+		grouped[userID] = append(grouped[userID], connection)
 	}
 	return grouped
 }

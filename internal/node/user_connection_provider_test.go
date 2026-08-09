@@ -159,7 +159,7 @@ func TestSingBoxUserConnectionProviderUsesClashAPI(t *testing.T) {
 				if got := r.Header.Get("Authorization"); got != "Bearer test-secret" {
 					t.Fatalf("expected bearer token, got %q", got)
 				}
-				return newHTTPResponse(http.StatusOK, `{"connections":[{"id":"a","metadata":{"sourceIP":"8.8.8.8","user":"2"}},{"id":"b","metadata":{"sourceIP":"1.1.1.1","user":"2"}},{"id":"c","metadata":{"sourceIP":"9.9.9.9","user":"5"}}]}`), nil
+				return newHTTPResponse(http.StatusOK, `{"connections":[{"id":"a","metadata":{"sourceIP":"8.8.8.8","user":"2.rwib.QW55VExT"}},{"id":"b","metadata":{"sourceIP":"1.1.1.1","user":"2.rwib.U0JfVHJvamFuX1dT"}},{"id":"c","metadata":{"sourceIP":"9.9.9.9","user":"5.rwib.QW55VExT"}}]}`), nil
 			}),
 		},
 	}
