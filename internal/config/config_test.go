@@ -26,12 +26,12 @@ func TestDetectVersionFallsBackToBuildVersion(t *testing.T) {
 	t.Setenv("REMNAWAVE_NODE_VERSION", "")
 
 	original := buildVersion
-	buildVersion = "2.7.0"
+	buildVersion = "3.0.0"
 	t.Cleanup(func() {
 		buildVersion = original
 	})
 
-	if got := detectVersion(); got != "2.7.0" {
-		t.Fatalf("detectVersion() = %q, want %q", got, "2.7.0")
+	if got := detectVersion(); got != "3.0.0" {
+		t.Fatalf("detectVersion() = %q, want %q", got, "3.0.0")
 	}
 }

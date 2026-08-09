@@ -13,7 +13,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  REMNAWAVE_NODE_VERSION: 2.7.0
+  REMNAWAVE_NODE_VERSION: 3.0.0
 
 jobs:
   docker:
@@ -44,6 +44,7 @@ jobs:
           tags: |
             type=raw,value=main,enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ env.REMNAWAVE_NODE_VERSION }}
             type=sha,format=short
 
       - name: Build and push
