@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-var buildVersion = "3.0.0"
+var buildVersion = "3.0.1"
 
 type Config struct {
 	NodePort            int
@@ -161,5 +161,5 @@ func detectVersion() string {
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
 		return info.Main.Version
 	}
-	return "3.0.0"
+	return "3.0.1"
 }

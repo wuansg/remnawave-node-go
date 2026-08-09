@@ -63,7 +63,10 @@ func newStatsClient(target string, transport credentials.TransportCredentials, s
 }
 
 func (c *GRPCStatsClient) Query(ctx context.Context, pattern string, reset bool) ([]Stat, error) {
-	request := &statscommand.QueryStatsRequest{Pattern: pattern, Reset_: reset}
+	var request any = &statscommand.QueryStatsRequest{Pattern: pattern, Reset_: reset}
+	if c.service == singBoxStatsService {
+		request = &singBoxQueryStatsRequest{Patterns: []string{pattern}, Reset_: reset}
+	}
 	response := new(statscommand.QueryStatsResponse)
 	if err := c.conn.Invoke(ctx, c.method("QueryStats"), request, response); err != nil {
 		return nil, fmt.Errorf("query stats %q: %w", pattern, err)
@@ -74,6 +77,19 @@ func (c *GRPCStatsClient) Query(ctx context.Context, pattern string, reset bool)
 	}
 	return items, nil
 }
+
+// singBoxQueryStatsRequest matches sing-box's QueryStatsRequest wire format.
+// Since sing-box 1.13, field 1 (pattern) is deprecated and the server only
+// applies field 3 (patterns). Sending the Xray request would therefore match
+// and reset every counter instead of only the requested group.
+type singBoxQueryStatsRequest struct {
+	Reset_   bool     `protobuf:"varint,2,opt,name=reset,proto3" json:"reset,omitempty"`
+	Patterns []string `protobuf:"bytes,3,rep,name=patterns,proto3" json:"patterns,omitempty"`
+}
+
+func (r *singBoxQueryStatsRequest) Reset()         { *r = singBoxQueryStatsRequest{} }
+func (r *singBoxQueryStatsRequest) String() string { return fmt.Sprintf("patterns:%v reset:%t", r.Patterns, r.Reset_) }
+func (*singBoxQueryStatsRequest) ProtoMessage()    {}
 
 func (c *GRPCStatsClient) System(ctx context.Context) (SystemStats, error) {
 	response := new(statscommand.SysStatsResponse)
