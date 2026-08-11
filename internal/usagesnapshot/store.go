@@ -24,6 +24,7 @@ var (
 	generationKey   = []byte("generation")
 	nextSequenceKey = []byte("next_sequence")
 	ackedKey        = []byte("acked_through")
+	lastCapturedKey = []byte("last_captured_at")
 	ErrNotActive    = errors.New("usage snapshot mode is not active")
 )
 
@@ -132,6 +133,9 @@ func (s *Store) Activate(counters []Counter) (Status, error) {
 		if err := putUint64(meta, ackedKey, 0); err != nil {
 			return err
 		}
+		if err := meta.Delete(lastCapturedKey); err != nil {
+			return err
+		}
 		if err := clearBucket(tx.Bucket(baselineBucket)); err != nil {
 			return err
 		}
@@ -185,7 +189,10 @@ func (s *Store) Capture(core string, counters []Counter, capturedAt time.Time, c
 		if err := tx.Bucket(snapshotsBucket).Put(sequenceKey(sequence), payload); err != nil {
 			return err
 		}
-		return putUint64(meta, nextSequenceKey, sequence+1)
+		if err := putUint64(meta, nextSequenceKey, sequence+1); err != nil {
+			return err
+		}
+		return meta.Put(lastCapturedKey, []byte(capturedAt.UTC().Format(time.RFC3339Nano)))
 	})
 }
 
@@ -264,17 +271,14 @@ func (s *Store) Status() (Status, error) {
 		}
 		status.AckedThrough = readUint64(meta.Get(ackedKey))
 		status.Bytes = snapshotBytes(snapshots)
+		status.LastCapturedAt = string(meta.Get(lastCapturedKey))
 		cursor := snapshots.Cursor()
 		first, _ := cursor.First()
 		if first != nil {
 			status.OldestSequence = binary.BigEndian.Uint64(first)
 		}
-		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+		for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
 			status.Pending++
-			var snapshot Snapshot
-			if json.Unmarshal(value, &snapshot) == nil {
-				status.LastCapturedAt = snapshot.CapturedAt.Format(time.RFC3339Nano)
-			}
 		}
 		return nil
 	})

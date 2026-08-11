@@ -34,7 +34,7 @@ func TestDurableDeltaPullAckAndRestart(t *testing.T) {
 		t.Fatalf("pull: %#v %v", pull, err)
 	}
 	status, err = store.Ack(AckRequest{Generation: pull.Generation, ThroughSequence: 1})
-	if err != nil || status.Pending != 0 || status.AckedThrough != 1 {
+	if err != nil || status.Pending != 0 || status.AckedThrough != 1 || status.LastCapturedAt != time.Unix(1, 0).UTC().Format(time.RFC3339Nano) {
 		t.Fatalf("ack: %#v %v", status, err)
 	}
 }
