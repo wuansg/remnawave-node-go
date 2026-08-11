@@ -1,6 +1,6 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
-ARG REMNAWAVE_NODE_VERSION=3.0.1
+ARG REMNAWAVE_NODE_VERSION=3.1.0
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -69,7 +69,7 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0"
 LABEL org.opencontainers.image.documentation="https://docs.rw"
 
 RUN apk add --no-cache supervisor curl ca-certificates iproute2 nftables \
-    && mkdir -p /var/log/supervisor /run/remnawave
+	&& mkdir -p /var/log/supervisor /run/remnawave /var/lib/remnanode
 
 COPY --from=go-build /out/remnawave-node-go /usr/local/bin/remnawave-node-go
 COPY --from=xray-build /usr/local/bin/xray /usr/local/bin/xray
@@ -95,6 +95,9 @@ ENV SING_BOX_V2RAY_API_PORT=61002
 ENV SING_BOX_VERSION=${SING_BOX_VERSION}
 ENV XRAY_CONFIG_PATH=/run/remnawave/xray.json
 ENV SING_BOX_CONFIG_PATH=/run/remnawave/sing-box.json
+ENV USAGE_SNAPSHOT_DB_PATH=/var/lib/remnanode/stats.db
+
+VOLUME ["/var/lib/remnanode"]
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/usr/local/bin/remnawave-node-go"]

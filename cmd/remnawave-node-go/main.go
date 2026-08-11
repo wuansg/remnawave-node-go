@@ -52,11 +52,18 @@ func main() {
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	usageTicker := time.NewTicker(time.Duration(cfg.UsageSnapshotInterval) * time.Second)
+	defer usageTicker.Stop()
 
 	go func() {
 		for range ticker.C {
 			networkMonitor.Tick()
 			manager.SyncProcessStatus(context.Background())
+		}
+	}()
+	go func() {
+		for range usageTicker.C {
+			manager.CaptureUsageSnapshot(context.Background())
 		}
 	}()
 

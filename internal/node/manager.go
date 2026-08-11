@@ -26,6 +26,7 @@ import (
 	"github.com/remnawave/remnawave-node-go/internal/statname"
 	"github.com/remnawave/remnawave-node-go/internal/supervisor"
 	"github.com/remnawave/remnawave-node-go/internal/system"
+	"github.com/remnawave/remnawave-node-go/internal/usagesnapshot"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -51,34 +52,31 @@ var (
 		"255.255.255.255": {},
 	}
 	singBoxKeyAliases = map[string]string{
-		"autoDetectInterface": "auto_detect_interface",
-		"certificatePath":     "certificate_path",
-		"congestionControl":   "congestion_control",
-		"domainSuffix":        "domain_suffix",
-		"downloadDetour":      "download_detour",
-		"cacheFile":           "cache_file",
-		"ipIsPrivate":         "ip_is_private",
-		"keyPath":             "key_path",
-		"listenPort":          "listen_port",
-		"ruleSet":             "rule_set",
-		"serverPort":          "server_port",
+		"certificatePath": "certificate_path",
+		"domainSuffix":    "domain_suffix",
+		"ipIsPrivate":     "ip_is_private",
+		"keyPath":         "key_path",
+		"listenPort":      "listen_port",
 	}
 )
 
 type Manager struct {
-	cfg        config.Config
-	state      *state.Runtime
-	logger     *slog.Logger
-	supervisor *supervisor.Client
-	network    *system.NetworkMonitor
-	nftReady   bool
-	startedAt  time.Time
-	coreMu     sync.Mutex
-	apiTLS     *coreapi.MTLSBundle
-	xrayStats  coreapi.StatsClient
-	singStats  coreapi.StatsClient
-	xrayHandle coreapi.HandlerClient
-	xrayRoute  coreapi.RoutingClient
+	cfg                config.Config
+	state              *state.Runtime
+	logger             *slog.Logger
+	supervisor         *supervisor.Client
+	network            *system.NetworkMonitor
+	nftReady           bool
+	startedAt          time.Time
+	coreMu             sync.Mutex
+	apiTLS             *coreapi.MTLSBundle
+	xrayStats          coreapi.StatsClient
+	singStats          coreapi.StatsClient
+	xrayHandle         coreapi.HandlerClient
+	xrayRoute          coreapi.RoutingClient
+	usageSnapshots     *usagesnapshot.Store
+	usageMu            sync.Mutex
+	usageCoreRestarted bool
 }
 
 type StartRequest struct {
@@ -239,19 +237,28 @@ func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Log
 		_ = xrayHandler.Close()
 		return nil, err
 	}
+	usageSnapshots, err := usagesnapshot.Open(cfg.UsageSnapshotDBPath, cfg.UsageSnapshotMaxBytes)
+	if err != nil {
+		_ = xrayStats.Close()
+		_ = singStats.Close()
+		_ = xrayHandler.Close()
+		_ = xrayRouting.Close()
+		return nil, err
+	}
 	return &Manager{
-		cfg:        cfg,
-		state:      runtimeState,
-		logger:     logger,
-		supervisor: client,
-		network:    network,
-		nftReady:   commandExists("nft") && hasNetAdmin(),
-		startedAt:  time.Now(),
-		apiTLS:     bundle,
-		xrayStats:  xrayStats,
-		singStats:  singStats,
-		xrayHandle: xrayHandler,
-		xrayRoute:  xrayRouting,
+		cfg:            cfg,
+		state:          runtimeState,
+		logger:         logger,
+		supervisor:     client,
+		network:        network,
+		nftReady:       commandExists("nft") && hasNetAdmin(),
+		startedAt:      time.Now(),
+		apiTLS:         bundle,
+		xrayStats:      xrayStats,
+		singStats:      singStats,
+		xrayHandle:     xrayHandler,
+		xrayRoute:      xrayRouting,
+		usageSnapshots: usageSnapshots,
 	}, nil
 }
 
@@ -272,6 +279,11 @@ func (m *Manager) Close() error {
 	}
 	if m.xrayRoute != nil {
 		if err := m.xrayRoute.Close(); first == nil {
+			first = err
+		}
+	}
+	if m.usageSnapshots != nil {
+		if err := m.usageSnapshots.Close(); first == nil {
 			first = err
 		}
 	}
@@ -345,6 +357,11 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 		started = singBoxOnline
 	}
 	m.logger.Info("node start request handled", "core", coreType, "remote_ip", remoteIP, "restarted", shouldRestart)
+	if shouldRestart && m.UsageSnapshotActive() {
+		m.usageMu.Lock()
+		m.usageCoreRestarted = true
+		m.usageMu.Unlock()
+	}
 	return wrapStartResponse(started, m.activeVersion(coreType), nil, m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
 }
 
@@ -394,8 +411,91 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 			"supportedCores":           []string{string(state.CoreTypeXRAY), string(state.CoreTypeSingBox)},
 			"coreVersions":             m.coreVersions(),
 			"nodeVersion":              m.state.NodeVersion(),
+			"capabilities":             []string{usagesnapshot.Capability},
 		},
 	}
+}
+
+func (m *Manager) UsageSnapshotActive() bool {
+	return m.usageSnapshots != nil && m.usageSnapshots.Active()
+}
+
+func (m *Manager) ActivateUsageSnapshots(ctx context.Context) (usagesnapshot.Status, error) {
+	if m.usageSnapshots == nil {
+		return usagesnapshot.Status{}, errors.New("usage snapshot storage is unavailable")
+	}
+	counters, err := m.currentUsageCounters(ctx)
+	if err != nil {
+		return usagesnapshot.Status{}, err
+	}
+	return m.usageSnapshots.Activate(counters)
+}
+
+func (m *Manager) CaptureUsageSnapshot(ctx context.Context) {
+	if !m.UsageSnapshotActive() {
+		return
+	}
+	counters, err := m.currentUsageCounters(ctx)
+	if err != nil {
+		m.logger.Warn("failed to capture usage snapshot", "error", err)
+		return
+	}
+	m.usageMu.Lock()
+	coreRestarted := m.usageCoreRestarted
+	m.usageCoreRestarted = false
+	m.usageMu.Unlock()
+	if err := m.usageSnapshots.Capture(string(m.state.RunningCoreType()), counters, time.Now(), coreRestarted); err != nil && !errors.Is(err, usagesnapshot.ErrNotActive) {
+		if coreRestarted {
+			m.usageMu.Lock()
+			m.usageCoreRestarted = true
+			m.usageMu.Unlock()
+		}
+		m.logger.Error("failed to persist usage snapshot", "error", err)
+	}
+}
+
+func (m *Manager) PullUsageSnapshots(request usagesnapshot.PullRequest) (usagesnapshot.PullResponse, error) {
+	if m.usageSnapshots == nil {
+		return usagesnapshot.PullResponse{}, errors.New("usage snapshot storage is unavailable")
+	}
+	return m.usageSnapshots.Pull(request)
+}
+
+func (m *Manager) AckUsageSnapshots(request usagesnapshot.AckRequest) (usagesnapshot.Status, error) {
+	if m.usageSnapshots == nil {
+		return usagesnapshot.Status{}, errors.New("usage snapshot storage is unavailable")
+	}
+	return m.usageSnapshots.Ack(request)
+}
+
+func (m *Manager) UsageSnapshotStatus() (usagesnapshot.Status, error) {
+	if m.usageSnapshots == nil {
+		return usagesnapshot.Status{}, errors.New("usage snapshot storage is unavailable")
+	}
+	return m.usageSnapshots.Status()
+}
+
+func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Counter, error) {
+	client := m.statsClient()
+	if client == nil || m.state.RunningCoreType() == "" {
+		return nil, ErrCoreUnavailable
+	}
+	result := make([]usagesnapshot.Counter, 0)
+	users := m.queryUserInboundStats(ctx, false)
+	for _, item := range users {
+		for _, direction := range []string{"uplink", "downlink"} {
+			result = append(result, usagesnapshot.Counter{Kind: "user", Name: item["username"].(string), Inbound: item["inbound"].(string), Direction: direction, Value: item[direction].(int64)})
+		}
+	}
+	for _, kind := range []string{"inbound", "outbound"} {
+		items := m.queryGroupedStats(ctx, kind, kind+">>>", false)
+		for _, item := range items {
+			for _, direction := range []string{"uplink", "downlink"} {
+				result = append(result, usagesnapshot.Counter{Kind: kind, Name: item[kind].(string), Direction: direction, Value: item[direction].(int64)})
+			}
+		}
+	}
+	return result, nil
 }
 
 func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {

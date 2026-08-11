@@ -22,5 +22,10 @@ services:
       SUPERVISORD_PID_PATH: ${SUPERVISORD_PID_PATH:-/run/remnawave/supervisord.pid}
       XRAY_CONFIG_PATH: ${XRAY_CONFIG_PATH:-/run/remnawave/xray.json}
       SING_BOX_CONFIG_PATH: ${SING_BOX_CONFIG_PATH:-/run/remnawave/sing-box.json}
+      USAGE_SNAPSHOT_DB_PATH: ${USAGE_SNAPSHOT_DB_PATH:-/var/lib/remnanode/stats.db}
     volumes:
       - ${ANYTLS_CERT_DIR:-/root/cert/anytls}:${ANYTLS_CERT_DIR:-/root/cert/anytls}:ro
+      - remnanode-stats:/var/lib/remnanode
+
+volumes:
+  remnanode-stats:

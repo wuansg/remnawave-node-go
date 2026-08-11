@@ -22,6 +22,7 @@ import (
 	"github.com/remnawave/remnawave-node-go/internal/auth"
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	nodeapp "github.com/remnawave/remnawave-node-go/internal/node"
+	"github.com/remnawave/remnawave-node-go/internal/usagesnapshot"
 )
 
 const maxRequestBodySize = int64(1 << 30)
@@ -205,11 +206,17 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
+		if body.Reset && s.rejectLegacyReset(w) {
+			return
+		}
 		writeJSON(w, http.StatusOK, s.manager.GetUsersStats(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/stats/get-users-inbound-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetUsersInboundStatsRequest
 		if !decodeJSON(w, r, &body) {
+			return
+		}
+		if body.Reset && s.rejectLegacyReset(w) {
 			return
 		}
 		writeJSON(w, http.StatusOK, s.manager.GetUsersInboundStats(r.Context(), body))
@@ -219,11 +226,17 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
+		if body.Reset && s.rejectLegacyReset(w) {
+			return
+		}
 		writeJSON(w, http.StatusOK, s.manager.GetInboundStats(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/stats/get-outbound-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetTagStatsRequest
 		if !decodeJSON(w, r, &body) {
+			return
+		}
+		if body.Reset && s.rejectLegacyReset(w) {
 			return
 		}
 		writeJSON(w, http.StatusOK, s.manager.GetOutboundStats(r.Context(), body))
@@ -233,11 +246,17 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
+		if body.Reset && s.rejectLegacyReset(w) {
+			return
+		}
 		writeJSON(w, http.StatusOK, s.manager.GetAllInboundStats(r.Context(), body))
 	}))
 	mux.HandleFunc("POST /node/stats/get-all-outbounds-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetResetRequest
 		if !decodeJSON(w, r, &body) {
+			return
+		}
+		if body.Reset && s.rejectLegacyReset(w) {
 			return
 		}
 		writeJSON(w, http.StatusOK, s.manager.GetAllOutboundStats(r.Context(), body))
@@ -247,7 +266,50 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
+		if body.Reset && s.rejectLegacyReset(w) {
+			return
+		}
 		writeJSON(w, http.StatusOK, s.manager.GetCombinedStats(r.Context(), body))
+	}))
+	mux.HandleFunc("POST /node/stats/usage-snapshots/activate", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		status, err := s.manager.ActivateUsageSnapshots(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"message": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": status})
+	}))
+	mux.HandleFunc("POST /node/stats/usage-snapshots/pull", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		var body usagesnapshot.PullRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		response, err := s.manager.PullUsageSnapshots(body)
+		if err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"message": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": response})
+	}))
+	mux.HandleFunc("POST /node/stats/usage-snapshots/ack", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		var body usagesnapshot.AckRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		status, err := s.manager.AckUsageSnapshots(body)
+		if err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"message": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": status})
+	}))
+	mux.HandleFunc("GET /node/stats/usage-snapshots/status", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		status, err := s.manager.UsageSnapshotStatus()
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"message": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": status})
 	}))
 	mux.HandleFunc("POST /node/stats/get-user-ip-list", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetUserIPListRequest
@@ -302,6 +364,14 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, s.manager.UnblockIP(r.Context(), body))
 	})
+}
+
+func (s *Server) rejectLegacyReset(w http.ResponseWriter) bool {
+	if !s.manager.UsageSnapshotActive() {
+		return false
+	}
+	writeJSON(w, http.StatusConflict, map[string]any{"message": "reset-based statistics are disabled while usage_snapshot_v1 is active"})
+	return true
 }
 
 func (s *Server) registerInternal(mux *http.ServeMux) {
