@@ -92,3 +92,27 @@ func TestHostAllowCommentIsStable(t *testing.T) {
 		t.Fatalf("unexpected host allow comment: %q", got)
 	}
 }
+
+func TestRenderHostFirewallRulesUsesDedicatedDockerUserChain(t *testing.T) {
+	cfg := Config{Enabled: true, ListenInterface: "ens18", Rules: []Rule{{
+		ID: "rule-one", Name: "nlfra", Enabled: true, Protocol: ProtocolTCPUDP,
+		ListenPort: 54321, TargetAddress: "82.39.212.176", TargetPort: 54332,
+	}}}
+	ruleset := renderHostFirewallRules(cfg, "ens18", map[string]string{"82.39.212.176": "ens18"}, true, true)
+	for _, expected := range []string{
+		"add chain ip filter REMNANODE_FORWARD",
+		"insert rule ip filter DOCKER-USER jump REMNANODE_FORWARD",
+		"tcp dport 54332 ct original proto-dst 54321",
+		"udp dport 54332 ct original proto-dst 54321",
+		"tcp sport 54332 ct original proto-dst 54321",
+		"remnanode-forward-host-allow:rule-one:tcp:up",
+		"remnanode-forward-host-allow:rule-one:udp:down",
+	} {
+		if !strings.Contains(ruleset, expected) {
+			t.Fatalf("host ruleset missing %q:\n%s", expected, ruleset)
+		}
+	}
+	if strings.Contains(ruleset, "flush chain ip filter DOCKER-USER") || strings.Contains(ruleset, "flush table") {
+		t.Fatalf("host ruleset touches unrelated firewall state:\n%s", ruleset)
+	}
+}

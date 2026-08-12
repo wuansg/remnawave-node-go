@@ -158,9 +158,23 @@ func (s *Service) Restore(ctx context.Context) error {
 	s.iface = persisted.Interface
 
 	if !s.applied.Enabled || enabledRuleCount(s.applied) == 0 {
+		if err := s.reconcileHostFirewall(ctx, s.applied, "", nil); err != nil {
+			s.lastError = fmt.Sprintf("restore host forwarding rules: %v", err)
+			return errors.New(s.lastError)
+		}
 		return nil
 	}
 	if s.tableMatches(ctx, s.appliedHash) {
+		iface, routes, err := s.validateLocked(ctx, s.applied, nil)
+		if err != nil {
+			s.lastError = fmt.Sprintf("validate restored forwarding rules: %v", err)
+			return errors.New(s.lastError)
+		}
+		if err := s.reconcileHostFirewall(ctx, s.applied, iface, routes); err != nil {
+			s.lastError = fmt.Sprintf("restore host forwarding rules: %v", err)
+			return errors.New(s.lastError)
+		}
+		s.iface = iface
 		return nil
 	}
 	if err := s.applyLocked(ctx, s.applied, nil); err != nil {
@@ -226,6 +240,9 @@ func (s *Service) applyLocked(ctx context.Context, cfg Config, coreListeners []L
 	}
 
 	if !cfg.Enabled || enabledRuleCount(cfg) == 0 {
+		if err := s.reconcileHostFirewall(ctx, cfg, "", nil); err != nil {
+			return err
+		}
 		if err := s.deleteTable(ctx); err != nil {
 			return err
 		}
@@ -243,6 +260,9 @@ func (s *Service) applyLocked(ctx context.Context, cfg Config, coreListeners []L
 	script := renderRuleset(cfg, iface, routes, hash, s.tableExists(ctx))
 	if err := runNFTScript(ctx, script, true); err != nil {
 		return fmt.Errorf("validate nftables rules: %w", err)
+	}
+	if err := s.reconcileHostFirewall(ctx, cfg, iface, routes); err != nil {
+		return fmt.Errorf("apply host firewall rules: %w", err)
 	}
 	if err := runNFTScript(ctx, script, false); err != nil {
 		return fmt.Errorf("apply nftables rules: %w", err)
