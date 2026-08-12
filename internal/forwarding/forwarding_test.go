@@ -2,6 +2,8 @@ package forwarding
 
 import (
 	"context"
+	"errors"
+	"net"
 	"strings"
 	"testing"
 )
@@ -114,5 +116,54 @@ func TestRenderHostFirewallRulesUsesDedicatedDockerUserChain(t *testing.T) {
 	}
 	if strings.Contains(ruleset, "flush chain ip filter DOCKER-USER") || strings.Contains(ruleset, "flush table") {
 		t.Fatalf("host ruleset touches unrelated firewall state:\n%s", ruleset)
+	}
+}
+
+func TestResolveTargetIPv4SupportsHostnameAndKeepsCurrentAddress(t *testing.T) {
+	service := New(t.TempDir()+"/forwarding.json", 2222, nil)
+	service.lookupIP = func(_ context.Context, network, host string) ([]net.IP, error) {
+		if network != "ip4" || host != "edge.example.com" {
+			t.Fatalf("unexpected lookup: %s %s", network, host)
+		}
+		return []net.IP{net.ParseIP("198.51.100.11"), net.ParseIP("198.51.100.10")}, nil
+	}
+
+	resolved, err := service.resolveTargetIPv4(context.Background(), "edge.example.com", "198.51.100.10")
+	if err != nil {
+		t.Fatalf("resolveTargetIPv4() error = %v", err)
+	}
+	if resolved != "198.51.100.10" {
+		t.Fatalf("resolveTargetIPv4() = %q, want the still-valid current address", resolved)
+	}
+}
+
+func TestResolveTargetIPv4ReportsDNSFailure(t *testing.T) {
+	service := New(t.TempDir()+"/forwarding.json", 2222, nil)
+	service.lookupIP = func(context.Context, string, string) ([]net.IP, error) {
+		return nil, errors.New("host not found")
+	}
+	_, err := service.resolveTargetIPv4(context.Background(), "missing.example.com", "")
+	if err == nil || !strings.Contains(err.Error(), "missing.example.com") {
+		t.Fatalf("expected a useful DNS error, got %v", err)
+	}
+}
+
+func TestNormalizeConfigCanonicalizesHostname(t *testing.T) {
+	cfg := normalizeConfig(Config{Rules: []Rule{{TargetAddress: " Edge.Example.COM. "}}})
+	if got := cfg.Rules[0].TargetAddress; got != "edge.example.com" {
+		t.Fatalf("normalized targetAddress = %q", got)
+	}
+}
+
+func TestValidHostname(t *testing.T) {
+	for _, value := range []string{"edge.example.com", "xn--fiqs8s.example", "internal-node"} {
+		if !isValidHostname(value) {
+			t.Errorf("expected %q to be valid", value)
+		}
+	}
+	for _, value := range []string{"", "-edge.example.com", "edge..example.com", "999.999.999.999", "edge_example.com"} {
+		if isValidHostname(value) {
+			t.Errorf("expected %q to be invalid", value)
+		}
 	}
 }

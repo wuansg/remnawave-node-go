@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-var buildVersion = "3.2.1"
+var buildVersion = "3.3.0"
 
 type Config struct {
 	NodePort              int

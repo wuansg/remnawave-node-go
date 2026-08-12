@@ -54,6 +54,8 @@ func main() {
 	defer ticker.Stop()
 	usageTicker := time.NewTicker(time.Duration(cfg.UsageSnapshotInterval) * time.Second)
 	defer usageTicker.Stop()
+	forwardingDNSTicker := time.NewTicker(time.Minute)
+	defer forwardingDNSTicker.Stop()
 
 	go func() {
 		for range ticker.C {
@@ -64,6 +66,11 @@ func main() {
 	go func() {
 		for range usageTicker.C {
 			manager.CaptureUsageSnapshot(context.Background())
+		}
+	}()
+	go func() {
+		for range forwardingDNSTicker.C {
+			manager.RefreshForwardingDNS(context.Background())
 		}
 	}()
 

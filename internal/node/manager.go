@@ -435,7 +435,7 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 			"supportedCores":           []string{string(state.CoreTypeXRAY), string(state.CoreTypeSingBox)},
 			"coreVersions":             m.coreVersions(),
 			"nodeVersion":              m.state.NodeVersion(),
-			"capabilities":             []string{usagesnapshot.Capability, forwarding.Capability},
+			"capabilities":             []string{usagesnapshot.Capability, forwarding.Capability, forwarding.DNSCapability},
 		},
 	}
 }
@@ -454,6 +454,16 @@ func (m *Manager) ForwardingSync(ctx context.Context, request forwarding.SyncReq
 
 func (m *Manager) ForwardingStatus(ctx context.Context) forwarding.Status {
 	return m.forwarding.Status(ctx)
+}
+
+func (m *Manager) RefreshForwardingDNS(ctx context.Context) {
+	m.coreMu.Lock()
+	defer m.coreMu.Unlock()
+	refreshCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := m.forwarding.RefreshDNS(refreshCtx, m.currentCoreListeners()); err != nil {
+		m.logger.Warn("failed to refresh forwarding DNS targets", "error", err)
+	}
 }
 
 func (m *Manager) currentCoreListeners() []forwarding.Listener {

@@ -22,9 +22,10 @@ import (
 )
 
 const (
-	Capability = "port_forwarding_v1"
-	TableName  = "remnanode_forward"
-	maxRules   = 64
+	Capability    = "port_forwarding_v1"
+	DNSCapability = "port_forwarding_dns_v1"
+	TableName     = "remnanode_forward"
+	maxRules      = 64
 )
 
 type Protocol string
@@ -72,9 +73,10 @@ type DirectionCounters struct {
 }
 
 type RuleStatus struct {
-	ID  string             `json:"id"`
-	TCP *DirectionCounters `json:"tcp,omitempty"`
-	UDP *DirectionCounters `json:"udp,omitempty"`
+	ID                    string             `json:"id"`
+	ResolvedTargetAddress string             `json:"resolvedTargetAddress,omitempty"`
+	TCP                   *DirectionCounters `json:"tcp,omitempty"`
+	UDP                   *DirectionCounters `json:"udp,omitempty"`
 }
 
 type Status struct {
@@ -109,11 +111,21 @@ func IsConflict(err error) bool {
 }
 
 type persistedState struct {
-	Config      Config    `json:"config"`
-	AppliedHash string    `json:"appliedHash"`
-	AppliedAt   time.Time `json:"appliedAt"`
-	Interface   string    `json:"resolvedListenInterface"`
+	Config          Config            `json:"config"`
+	AppliedHash     string            `json:"appliedHash"`
+	AppliedAt       time.Time         `json:"appliedAt"`
+	Interface       string            `json:"resolvedListenInterface"`
+	ResolvedTargets map[string]string `json:"resolvedTargets,omitempty"`
 }
+
+type preparedConfig struct {
+	config          Config
+	iface           string
+	routes          map[string]string
+	resolvedTargets map[string]string
+}
+
+type lookupIPFunc func(context.Context, string, string) ([]net.IP, error)
 
 type Service struct {
 	mu          sync.Mutex
@@ -124,11 +136,13 @@ type Service struct {
 	appliedHash string
 	appliedAt   *time.Time
 	iface       string
+	resolved    map[string]string
 	lastError   string
+	lookupIP    lookupIPFunc
 }
 
 func New(path string, nodePort int, logger *slog.Logger) *Service {
-	return &Service{path: path, nodePort: nodePort, logger: logger}
+	return &Service{path: path, nodePort: nodePort, logger: logger, lookupIP: net.DefaultResolver.LookupIP}
 }
 
 func DefaultConfig() Config {
@@ -156,6 +170,7 @@ func (s *Service) Restore(ctx context.Context) error {
 	s.appliedHash = persisted.AppliedHash
 	s.appliedAt = &persisted.AppliedAt
 	s.iface = persisted.Interface
+	s.resolved = persisted.ResolvedTargets
 
 	if !s.applied.Enabled || enabledRuleCount(s.applied) == 0 {
 		if err := s.reconcileHostFirewall(ctx, s.applied, "", nil); err != nil {
@@ -165,16 +180,24 @@ func (s *Service) Restore(ctx context.Context) error {
 		return nil
 	}
 	if s.tableMatches(ctx, s.appliedHash) {
-		iface, routes, err := s.validateLocked(ctx, s.applied, nil)
+		prepared, err := s.validateLocked(ctx, s.applied, nil)
 		if err != nil {
 			s.lastError = fmt.Sprintf("validate restored forwarding rules: %v", err)
 			return errors.New(s.lastError)
 		}
-		if err := s.reconcileHostFirewall(ctx, s.applied, iface, routes); err != nil {
+		if !sameStringMap(s.resolved, prepared.resolvedTargets) {
+			if err := s.applyPreparedLocked(ctx, s.applied, prepared, true); err != nil {
+				s.lastError = fmt.Sprintf("refresh restored forwarding targets: %v", err)
+				return errors.New(s.lastError)
+			}
+			return nil
+		}
+		if err := s.reconcileHostFirewall(ctx, prepared.config, prepared.iface, prepared.routes); err != nil {
 			s.lastError = fmt.Sprintf("restore host forwarding rules: %v", err)
 			return errors.New(s.lastError)
 		}
-		s.iface = iface
+		s.iface = prepared.iface
+		s.resolved = prepared.resolvedTargets
 		return nil
 	}
 	if err := s.applyLocked(ctx, s.applied, nil); err != nil {
@@ -187,7 +210,7 @@ func (s *Service) Restore(ctx context.Context) error {
 func (s *Service) Validate(ctx context.Context, cfg Config, coreListeners []Listener) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, _, err := s.validateLocked(ctx, normalizeConfig(cfg), coreListeners)
+	_, err := s.validateLocked(ctx, normalizeConfig(cfg), coreListeners)
 	return err
 }
 
@@ -207,6 +230,29 @@ func (s *Service) Status(ctx context.Context) Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.statusLocked(ctx)
+}
+
+// RefreshDNS reapplies forwarding only when an enabled hostname resolves to a
+// different IPv4 address. A transient DNS failure leaves the working rules in
+// place and is returned to the caller for logging.
+func (s *Service) RefreshDNS(ctx context.Context, coreListeners []Listener) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.applied.Enabled || enabledHostnameRuleCount(s.applied) == 0 {
+		return nil
+	}
+	prepared, err := s.validateLocked(ctx, s.applied, coreListeners)
+	if err != nil {
+		return err
+	}
+	if sameStringMap(s.resolved, prepared.resolvedTargets) {
+		return nil
+	}
+	if err := s.applyPreparedLocked(ctx, s.applied, prepared, true); err != nil {
+		return err
+	}
+	s.lastError = ""
+	return nil
 }
 
 func (s *Service) ValidateCoreConfig(coreType string, coreConfig map[string]any) error {
@@ -230,10 +276,14 @@ func (s *Service) ValidateCoreConfig(coreType string, coreConfig map[string]any)
 }
 
 func (s *Service) applyLocked(ctx context.Context, cfg Config, coreListeners []Listener) error {
-	iface, routes, err := s.validateLocked(ctx, cfg, coreListeners)
+	prepared, err := s.validateLocked(ctx, cfg, coreListeners)
 	if err != nil {
 		return err
 	}
+	return s.applyPreparedLocked(ctx, cfg, prepared, false)
+}
+
+func (s *Service) applyPreparedLocked(ctx context.Context, cfg Config, prepared preparedConfig, skipConflicts bool) error {
 	hash, err := configHash(cfg)
 	if err != nil {
 		return err
@@ -250,61 +300,78 @@ func (s *Service) applyLocked(ctx context.Context, cfg Config, coreListeners []L
 		if err := s.persist(persistedState{Config: cfg, AppliedHash: hash, AppliedAt: now}); err != nil {
 			return err
 		}
-		s.applied, s.appliedHash, s.appliedAt, s.iface = cfg, hash, &now, ""
+		s.applied, s.appliedHash, s.appliedAt, s.iface, s.resolved = cfg, hash, &now, "", map[string]string{}
 		return nil
 	}
 
 	if err := ensureIPv4Forwarding(); err != nil {
 		return err
 	}
-	script := renderRuleset(cfg, iface, routes, hash, s.tableExists(ctx))
+	if !skipConflicts {
+		if err := detectSocketConflicts(ctx, cfg, prepared.iface); err != nil {
+			return err
+		}
+		if err := detectNFTConflicts(ctx, cfg); err != nil {
+			return err
+		}
+	}
+	script := renderRuleset(prepared.config, prepared.iface, prepared.routes, hash, s.tableExists(ctx))
 	if err := runNFTScript(ctx, script, true); err != nil {
 		return fmt.Errorf("validate nftables rules: %w", err)
 	}
-	if err := s.reconcileHostFirewall(ctx, cfg, iface, routes); err != nil {
+	if err := s.reconcileHostFirewall(ctx, prepared.config, prepared.iface, prepared.routes); err != nil {
 		return fmt.Errorf("apply host firewall rules: %w", err)
 	}
 	if err := runNFTScript(ctx, script, false); err != nil {
 		return fmt.Errorf("apply nftables rules: %w", err)
 	}
 	now := time.Now().UTC()
-	if err := s.persist(persistedState{Config: cfg, AppliedHash: hash, AppliedAt: now, Interface: iface}); err != nil {
+	if err := s.persist(persistedState{Config: cfg, AppliedHash: hash, AppliedAt: now, Interface: prepared.iface, ResolvedTargets: prepared.resolvedTargets}); err != nil {
 		return err
 	}
-	s.applied, s.appliedHash, s.appliedAt, s.iface = cfg, hash, &now, iface
+	s.applied, s.appliedHash, s.appliedAt, s.iface, s.resolved = cfg, hash, &now, prepared.iface, prepared.resolvedTargets
 	return nil
 }
 
-func (s *Service) validateLocked(ctx context.Context, cfg Config, coreListeners []Listener) (string, map[string]string, error) {
+func (s *Service) validateLocked(ctx context.Context, cfg Config, coreListeners []Listener) (preparedConfig, error) {
+	result := preparedConfig{config: cfg, routes: map[string]string{}, resolvedTargets: map[string]string{}}
 	if len(cfg.Rules) > maxRules {
-		return "", nil, fmt.Errorf("forwarding rules exceed maximum of %d", maxRules)
+		return result, fmt.Errorf("forwarding rules exceed maximum of %d", maxRules)
 	}
 	localAddresses := localIPv4Addresses()
 	seenIDs := map[string]struct{}{}
 	for i, rule := range cfg.Rules {
 		if strings.TrimSpace(rule.ID) == "" {
-			return "", nil, fmt.Errorf("rule %d id is required", i+1)
+			return result, fmt.Errorf("rule %d id is required", i+1)
 		}
 		if _, ok := seenIDs[rule.ID]; ok {
-			return "", nil, fmt.Errorf("duplicate forwarding rule id %q", rule.ID)
+			return result, fmt.Errorf("duplicate forwarding rule id %q", rule.ID)
 		}
 		seenIDs[rule.ID] = struct{}{}
 		if len(strings.TrimSpace(rule.Name)) < 1 || len(rule.Name) > 64 {
-			return "", nil, fmt.Errorf("rule %s name must be 1-64 characters", rule.ID)
+			return result, fmt.Errorf("rule %s name must be 1-64 characters", rule.ID)
 		}
 		if rule.Protocol != ProtocolTCP && rule.Protocol != ProtocolUDP && rule.Protocol != ProtocolTCPUDP {
-			return "", nil, fmt.Errorf("rule %s has unsupported protocol %q", rule.ID, rule.Protocol)
+			return result, fmt.Errorf("rule %s has unsupported protocol %q", rule.ID, rule.Protocol)
 		}
 		if rule.ListenPort < 1 || rule.ListenPort > 65535 || rule.TargetPort < 1 || rule.TargetPort > 65535 {
-			return "", nil, fmt.Errorf("rule %s port must be between 1 and 65535", rule.ID)
+			return result, fmt.Errorf("rule %s port must be between 1 and 65535", rule.ID)
 		}
-		ip := net.ParseIP(rule.TargetAddress)
-		if ip == nil || ip.To4() == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.Equal(net.IPv4bcast) {
-			return "", nil, fmt.Errorf("rule %s targetAddress must be a routable IPv4 literal", rule.ID)
+		if !isIPv4Literal(rule.TargetAddress) && !isValidHostname(rule.TargetAddress) {
+			return result, fmt.Errorf("rule %s targetAddress must be a routable IPv4 address or valid hostname", rule.ID)
 		}
-		if _, local := localAddresses[ip.String()]; local {
-			return "", nil, fmt.Errorf("rule %s targetAddress resolves to this node", rule.ID)
+		if !rule.Enabled {
+			continue
 		}
+		resolved, err := s.resolveTargetIPv4(ctx, rule.TargetAddress, s.resolved[rule.ID])
+		if err != nil {
+			return result, fmt.Errorf("rule %s: %w", rule.ID, err)
+		}
+		if _, local := localAddresses[resolved]; local {
+			return result, fmt.Errorf("rule %s targetAddress resolves to this node (%s)", rule.ID, resolved)
+		}
+		result.config.Rules[i].TargetAddress = resolved
+		result.resolvedTargets[rule.ID] = resolved
 	}
 
 	for i, left := range cfg.Rules {
@@ -313,49 +380,43 @@ func (s *Service) validateLocked(ctx context.Context, cfg Config, coreListeners 
 		}
 		for _, right := range cfg.Rules[i+1:] {
 			if right.Enabled && left.ListenPort == right.ListenPort && protocolsOverlap(left.Protocol, right.Protocol) {
-				return "", nil, &ConflictError{Protocol: overlapProtocol(left.Protocol, right.Protocol), Port: left.ListenPort, ConflictsWith: "FORWARDING_RULE", Detail: right.Name}
+				return result, &ConflictError{Protocol: overlapProtocol(left.Protocol, right.Protocol), Port: left.ListenPort, ConflictsWith: "FORWARDING_RULE", Detail: right.Name}
 			}
 		}
 	}
 
 	if !cfg.Enabled || enabledRuleCount(cfg) == 0 {
-		return "", map[string]string{}, nil
+		return result, nil
 	}
 	iface, err := resolveListenInterface(ctx, cfg.ListenInterface)
 	if err != nil {
-		return "", nil, err
+		return result, err
 	}
+	result.iface = iface
 	for _, rule := range cfg.Rules {
 		if !rule.Enabled {
 			continue
 		}
 		for _, listener := range coreListeners {
 			if rule.ListenPort == listener.Port && protocolsOverlap(rule.Protocol, listener.Protocol) {
-				return "", nil, &ConflictError{Protocol: overlapProtocol(rule.Protocol, listener.Protocol), Port: rule.ListenPort, ConflictsWith: "CORE_INBOUND", Detail: listener.Source}
+				return result, &ConflictError{Protocol: overlapProtocol(rule.Protocol, listener.Protocol), Port: rule.ListenPort, ConflictsWith: "CORE_INBOUND", Detail: listener.Source}
 			}
 		}
 	}
-	if err := detectSocketConflicts(ctx, cfg, iface); err != nil {
-		return "", nil, err
-	}
-	if err := detectNFTConflicts(ctx, cfg); err != nil {
-		return "", nil, err
-	}
-	routes := map[string]string{}
-	for _, rule := range cfg.Rules {
+	for _, rule := range result.config.Rules {
 		if !rule.Enabled {
 			continue
 		}
-		if _, ok := routes[rule.TargetAddress]; ok {
+		if _, ok := result.routes[rule.TargetAddress]; ok {
 			continue
 		}
 		egress, err := resolveTargetInterface(ctx, rule.TargetAddress)
 		if err != nil {
-			return "", nil, err
+			return result, err
 		}
-		routes[rule.TargetAddress] = egress
+		result.routes[rule.TargetAddress] = egress
 	}
-	return iface, routes, nil
+	return result, nil
 }
 
 func (s *Service) statusLocked(ctx context.Context) Status {
@@ -384,7 +445,7 @@ func (s *Service) statusLocked(ctx context.Context) Status {
 		if !rule.Enabled {
 			continue
 		}
-		item := RuleStatus{ID: rule.ID}
+		item := RuleStatus{ID: rule.ID, ResolvedTargetAddress: s.resolved[rule.ID]}
 		if rule.Protocol == ProtocolTCP || rule.Protocol == ProtocolTCPUDP {
 			value := directionCounters(counters, rule.ID, "tcp")
 			item.TCP = &value
@@ -463,9 +524,96 @@ func normalizeConfig(cfg Config) Config {
 	for i := range cfg.Rules {
 		cfg.Rules[i].ID = strings.TrimSpace(cfg.Rules[i].ID)
 		cfg.Rules[i].Name = strings.TrimSpace(cfg.Rules[i].Name)
-		cfg.Rules[i].TargetAddress = strings.TrimSpace(cfg.Rules[i].TargetAddress)
+		cfg.Rules[i].TargetAddress = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cfg.Rules[i].TargetAddress), "."))
 	}
 	return cfg
+}
+
+func enabledHostnameRuleCount(cfg Config) int {
+	count := 0
+	for _, rule := range cfg.Rules {
+		if rule.Enabled && !isIPv4Literal(rule.TargetAddress) {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *Service) resolveTargetIPv4(ctx context.Context, target, preferred string) (string, error) {
+	if ip := net.ParseIP(target); ip != nil {
+		if !isRoutableIPv4(ip) {
+			return "", fmt.Errorf("targetAddress %q must be a routable IPv4 address", target)
+		}
+		return ip.String(), nil
+	}
+	if !isValidHostname(target) {
+		return "", fmt.Errorf("targetAddress %q is not a valid hostname", target)
+	}
+	ips, err := s.lookupIP(ctx, "ip4", target)
+	if err != nil {
+		return "", fmt.Errorf("resolve targetAddress %q: %w", target, err)
+	}
+	resolved := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		if isRoutableIPv4(ip) {
+			value := ip.String()
+			if value == preferred {
+				return value, nil
+			}
+			resolved = append(resolved, value)
+		}
+	}
+	if len(resolved) == 0 {
+		return "", fmt.Errorf("targetAddress %q has no routable IPv4 address", target)
+	}
+	return resolved[0], nil
+}
+
+func isIPv4Literal(value string) bool {
+	ip := net.ParseIP(value)
+	return ip != nil && ip.To4() != nil
+}
+
+func isRoutableIPv4(ip net.IP) bool {
+	return ip != nil && ip.To4() != nil && !ip.IsUnspecified() && !ip.IsLoopback() && !ip.IsMulticast() && !ip.IsLinkLocalUnicast() && !ip.Equal(net.IPv4bcast)
+}
+
+func isValidHostname(value string) bool {
+	if len(value) == 0 || len(value) > 253 || strings.Contains(value, "..") || onlyDigitsAndDots(value) {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func onlyDigitsAndDots(value string) bool {
+	for _, char := range value {
+		if (char < '0' || char > '9') && char != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func sameStringMap(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func enabledRuleCount(cfg Config) int {
