@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-var buildVersion = "3.1.0"
+var buildVersion = "3.2.0"
 
 type Config struct {
 	NodePort              int
@@ -35,6 +35,7 @@ type Config struct {
 	UsageSnapshotDBPath   string
 	UsageSnapshotInterval int
 	UsageSnapshotMaxBytes int64
+	ForwardingStatePath   string
 }
 
 type NodePayload struct {
@@ -75,6 +76,7 @@ func Load() (Config, error) {
 		UsageSnapshotDBPath:   envString("USAGE_SNAPSHOT_DB_PATH", "/var/lib/remnanode/stats.db"),
 		UsageSnapshotInterval: envInt("USAGE_SNAPSHOT_INTERVAL_SECONDS", 10),
 		UsageSnapshotMaxBytes: int64(envInt("USAGE_SNAPSHOT_MAX_MIB", 256)) << 20,
+		ForwardingStatePath:   envString("FORWARDING_STATE_PATH", "/var/lib/remnanode/forwarding.json"),
 	}, nil
 }
 

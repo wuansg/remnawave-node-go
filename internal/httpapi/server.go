@@ -21,6 +21,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/remnawave/remnawave-node-go/internal/auth"
 	"github.com/remnawave/remnawave-node-go/internal/config"
+	"github.com/remnawave/remnawave-node-go/internal/forwarding"
 	nodeapp "github.com/remnawave/remnawave-node-go/internal/node"
 	"github.com/remnawave/remnawave-node-go/internal/usagesnapshot"
 )
@@ -127,6 +128,32 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 	}))
 	mux.HandleFunc("GET /node/xray/healthcheck", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.manager.Healthcheck(r.Context()))
+	}))
+	mux.HandleFunc("POST /node/forwarding/validate", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		var body forwarding.SyncRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		if err := s.manager.ForwardingValidate(r.Context(), body); err != nil {
+			writeForwardingError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": map[string]any{"accepted": true}})
+	}))
+	mux.HandleFunc("POST /node/forwarding/sync", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		var body forwarding.SyncRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		status, err := s.manager.ForwardingSync(r.Context(), body)
+		if err != nil {
+			writeForwardingError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": status})
+	}))
+	mux.HandleFunc("GET /node/forwarding/status", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"response": s.manager.ForwardingStatus(r.Context())})
 	}))
 
 	mux.HandleFunc("POST /node/handler/add-user", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
@@ -364,6 +391,18 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, s.manager.UnblockIP(r.Context(), body))
 	})
+}
+
+func writeForwardingError(w http.ResponseWriter, err error) {
+	status := http.StatusUnprocessableEntity
+	response := map[string]any{"message": err.Error(), "code": "FORWARDING_APPLY_FAILED"}
+	var conflict *forwarding.ConflictError
+	if errors.As(err, &conflict) {
+		status = http.StatusConflict
+		response["code"] = "FORWARDING_PORT_CONFLICT"
+		response["conflict"] = conflict
+	}
+	writeJSON(w, status, response)
 }
 
 func (s *Server) rejectLegacyReset(w http.ResponseWriter) bool {

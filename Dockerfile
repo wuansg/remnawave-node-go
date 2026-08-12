@@ -1,6 +1,6 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
-ARG REMNAWAVE_NODE_VERSION=3.1.0
+ARG REMNAWAVE_NODE_VERSION=3.2.0
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -96,6 +96,7 @@ ENV SING_BOX_VERSION=${SING_BOX_VERSION}
 ENV XRAY_CONFIG_PATH=/run/remnawave/xray.json
 ENV SING_BOX_CONFIG_PATH=/run/remnawave/sing-box.json
 ENV USAGE_SNAPSHOT_DB_PATH=/var/lib/remnanode/stats.db
+ENV FORWARDING_STATE_PATH=/var/lib/remnanode/forwarding.json
 
 VOLUME ["/var/lib/remnanode"]
 

@@ -23,6 +23,7 @@ services:
       XRAY_CONFIG_PATH: ${XRAY_CONFIG_PATH:-/run/remnawave/xray.json}
       SING_BOX_CONFIG_PATH: ${SING_BOX_CONFIG_PATH:-/run/remnawave/sing-box.json}
       USAGE_SNAPSHOT_DB_PATH: ${USAGE_SNAPSHOT_DB_PATH:-/var/lib/remnanode/stats.db}
+      FORWARDING_STATE_PATH: ${FORWARDING_STATE_PATH:-/var/lib/remnanode/forwarding.json}
     volumes:
       - ${ANYTLS_CERT_DIR:-/root/cert/anytls}:${ANYTLS_CERT_DIR:-/root/cert/anytls}:ro
       - remnanode-stats:/var/lib/remnanode

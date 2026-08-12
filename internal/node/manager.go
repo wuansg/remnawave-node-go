@@ -22,6 +22,7 @@ import (
 
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	"github.com/remnawave/remnawave-node-go/internal/coreapi"
+	"github.com/remnawave/remnawave-node-go/internal/forwarding"
 	"github.com/remnawave/remnawave-node-go/internal/state"
 	"github.com/remnawave/remnawave-node-go/internal/statname"
 	"github.com/remnawave/remnawave-node-go/internal/supervisor"
@@ -75,6 +76,7 @@ type Manager struct {
 	xrayHandle         coreapi.HandlerClient
 	xrayRoute          coreapi.RoutingClient
 	usageSnapshots     *usagesnapshot.Store
+	forwarding         *forwarding.Service
 	usageMu            sync.Mutex
 	usageCoreRestarted bool
 }
@@ -245,7 +247,7 @@ func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Log
 		_ = xrayRouting.Close()
 		return nil, err
 	}
-	return &Manager{
+	manager := &Manager{
 		cfg:            cfg,
 		state:          runtimeState,
 		logger:         logger,
@@ -259,7 +261,12 @@ func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Log
 		xrayHandle:     xrayHandler,
 		xrayRoute:      xrayRouting,
 		usageSnapshots: usageSnapshots,
-	}, nil
+		forwarding:     forwarding.New(cfg.ForwardingStatePath, cfg.NodePort, logger),
+	}
+	if err := manager.forwarding.Restore(context.Background()); err != nil {
+		logger.Error("failed to restore forwarding rules", "error", err)
+	}
+	return manager, nil
 }
 
 func (m *Manager) Close() error {
@@ -328,6 +335,9 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 		if len(config) == 0 {
 			return wrapStartResponse(false, nil, ptrString("singBoxConfig is required for SING_BOX core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
 		}
+		if err := m.forwarding.ValidateCoreConfig(string(coreType), config); err != nil {
+			return m.coreConflictResponse(ctx, err)
+		}
 		shouldRestart = shouldRestart || !reflect.DeepEqual(m.state.SingBoxConfig(), config)
 		m.state.SetSingBoxConfig(config)
 		if shouldRestart {
@@ -339,6 +349,9 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 		config := applyXrayAPIConfig(cloneMap(request.XrayConfig), m.cfg, m.state.PluginState(), m.apiTLS)
 		if len(config) == 0 {
 			return wrapStartResponse(false, nil, ptrString("xrayConfig is required for XRAY core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
+		}
+		if err := m.forwarding.ValidateCoreConfig(string(coreType), config); err != nil {
+			return m.coreConflictResponse(ctx, err)
 		}
 		shouldRestart = shouldRestart || !reflect.DeepEqual(m.state.XrayConfig(), config)
 		m.state.SetXrayConfig(config)
@@ -363,6 +376,17 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 		m.usageMu.Unlock()
 	}
 	return wrapStartResponse(started, m.activeVersion(coreType), nil, m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
+}
+
+func (m *Manager) coreConflictResponse(ctx context.Context, err error) map[string]any {
+	m.refreshOnlineStatus(ctx)
+	running := m.state.RunningCoreType()
+	xrayOnline, singBoxOnline := m.state.OnlineStatus()
+	started := xrayOnline
+	if running == state.CoreTypeSingBox {
+		started = singBoxOnline
+	}
+	return wrapStartResponse(started, m.activeVersion(running), ptrString(err.Error()), m.state.NodeVersion(), system.SystemSnapshot(m.network), string(running), m.coreVersions())
 }
 
 func (m *Manager) shouldRestartCore(coreType state.CoreType, force bool, hashes state.StartHashes) bool {
@@ -411,8 +435,35 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 			"supportedCores":           []string{string(state.CoreTypeXRAY), string(state.CoreTypeSingBox)},
 			"coreVersions":             m.coreVersions(),
 			"nodeVersion":              m.state.NodeVersion(),
-			"capabilities":             []string{usagesnapshot.Capability},
+			"capabilities":             []string{usagesnapshot.Capability, forwarding.Capability},
 		},
+	}
+}
+
+func (m *Manager) ForwardingValidate(ctx context.Context, request forwarding.SyncRequest) error {
+	m.coreMu.Lock()
+	defer m.coreMu.Unlock()
+	return m.forwarding.Validate(ctx, request.Config, m.currentCoreListeners())
+}
+
+func (m *Manager) ForwardingSync(ctx context.Context, request forwarding.SyncRequest) (forwarding.Status, error) {
+	m.coreMu.Lock()
+	defer m.coreMu.Unlock()
+	return m.forwarding.Sync(ctx, request.Config, m.currentCoreListeners())
+}
+
+func (m *Manager) ForwardingStatus(ctx context.Context) forwarding.Status {
+	return m.forwarding.Status(ctx)
+}
+
+func (m *Manager) currentCoreListeners() []forwarding.Listener {
+	switch m.state.RunningCoreType() {
+	case state.CoreTypeSingBox:
+		return forwarding.ExtractCoreListeners(string(state.CoreTypeSingBox), m.state.SingBoxConfig())
+	case state.CoreTypeXRAY:
+		return forwarding.ExtractCoreListeners(string(state.CoreTypeXRAY), m.state.XrayConfig())
+	default:
+		return nil
 	}
 }
 
