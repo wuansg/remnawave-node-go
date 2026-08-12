@@ -84,3 +84,11 @@ func TestRenderRulesetUsesIsolatedTableAndDirectionalCounters(t *testing.T) {
 		t.Fatalf("ruleset touches unrelated nftables state:\n%s", ruleset)
 	}
 }
+
+func TestHostAllowCommentIsStable(t *testing.T) {
+	got := hostAllowComment("01989d90-cd3a-7e24-9ab2-a37b39acde11", "tcp", "up")
+	want := "remnanode-forward-host-allow:01989d90-cd3a-7e24-9ab2-a37b39acde11:tcp:up"
+	if got != want {
+		t.Fatalf("unexpected host allow comment: %q", got)
+	}
+}

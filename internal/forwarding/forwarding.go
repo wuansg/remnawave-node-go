@@ -355,9 +355,9 @@ func (s *Service) statusLocked(ctx context.Context) Status {
 		ForwardingEnabled: readIPv4Forwarding(), FirewallForwardPolicy: firewallForwardPolicy(ctx),
 		Rules: []RuleStatus{},
 	}
-	if status.State == "applied" && status.FirewallForwardPolicy == "drop" {
+	if status.State == "applied" && status.FirewallForwardPolicy == "drop" && !hostFirewallAllows(ctx, s.applied) {
 		status.State = "degraded"
-		status.LastError = "host FORWARD policy is drop; add an explicit host firewall allow rule for forwarded traffic"
+		status.LastError = "host FORWARD policy is drop; add explicit allow rules with remnanode-forward-host-allow comments for every forwarded flow"
 	}
 	counters := readCounters(ctx)
 	for _, rule := range s.applied.Rules {
@@ -649,6 +649,32 @@ func firewallForwardPolicy(ctx context.Context) string {
 		return "accept"
 	}
 	return "unknown"
+}
+
+func hostFirewallAllows(ctx context.Context, cfg Config) bool {
+	out, err := exec.CommandContext(ctx, "nft", "list", "ruleset").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	ruleset := string(out)
+	for _, rule := range cfg.Rules {
+		if !rule.Enabled {
+			continue
+		}
+		for _, protocol := range expandedProtocols(rule.Protocol) {
+			for _, direction := range []string{"up", "down"} {
+				comment := hostAllowComment(rule.ID, protocol, direction)
+				if !strings.Contains(ruleset, comment) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func hostAllowComment(id, protocol, direction string) string {
+	return "remnanode-forward-host-allow:" + id + ":" + protocol + ":" + direction
 }
 
 func runNFTScript(ctx context.Context, script string, check bool) error {
