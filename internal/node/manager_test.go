@@ -5,7 +5,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/remnawave/remnawave-node-go/internal/coreapi"
 	"github.com/remnawave/remnawave-node-go/internal/state"
 	"github.com/remnawave/remnawave-node-go/internal/statname"
+	"github.com/remnawave/remnawave-node-go/internal/supervisor"
 	"github.com/remnawave/remnawave-node-go/internal/system"
 )
 
@@ -38,6 +42,225 @@ func (f *fakeStatsClient) OnlineUsers(context.Context) ([]string, error) {
 	return []string{"user-a"}, nil
 }
 func (f *fakeStatsClient) Close() error { return nil }
+
+type fakeProcessSupervisor struct {
+	states      map[string]int
+	starts      []string
+	stops       []string
+	startErrors []error
+}
+
+func newFakeProcessSupervisor() *fakeProcessSupervisor {
+	return &fakeProcessSupervisor{states: map[string]int{
+		xrayProcessName:    supervisor.StateStopped,
+		singBoxProcessName: supervisor.StateStopped,
+	}}
+}
+
+func (f *fakeProcessSupervisor) StartProcess(_ context.Context, name string) error {
+	f.starts = append(f.starts, name)
+	if len(f.startErrors) > 0 {
+		err := f.startErrors[0]
+		f.startErrors = f.startErrors[1:]
+		if err != nil {
+			f.states[name] = supervisor.StateFatal
+			return err
+		}
+	}
+	f.states[name] = supervisor.StateRunning
+	return nil
+}
+
+func (f *fakeProcessSupervisor) StopProcess(_ context.Context, name string) error {
+	f.stops = append(f.stops, name)
+	f.states[name] = supervisor.StateStopped
+	return nil
+}
+
+func (f *fakeProcessSupervisor) GetProcessInfo(_ context.Context, name string) (supervisor.ProcessInfo, error) {
+	stateValue := f.states[name]
+	stateName := "STOPPED"
+	if stateValue == supervisor.StateRunning {
+		stateName = "RUNNING"
+	} else if stateValue == supervisor.StateFatal {
+		stateName = "FATAL"
+	}
+	return supervisor.ProcessInfo{Name: name, State: stateValue, StateName: stateName}, nil
+}
+
+func TestRestartSingBoxRejectsInvalidCandidateWithoutStoppingCurrentCore(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "sing-box.json")
+	lastGoodPath := filepath.Join(dir, "sing-box.last-good.json")
+	oldBytes := []byte(`{"inbounds":[{"tag":"old","type":"anytls"}]}`)
+	if err := os.WriteFile(configPath, oldBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig := map[string]any{"inbounds": []any{map[string]any{"tag": "old", "type": "anytls"}}}
+	runtimeState := state.New("test")
+	runtimeState.SetSingBoxConfig(oldConfig)
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.SetOnlineStatus(false, true)
+	// Dynamic user updates mutate runtime state before restarting the core. The
+	// rollback path must recover the actual running configuration from disk.
+	runtimeState.SetSingBoxConfig(map[string]any{"inbounds": []any{map[string]any{"tag": "new", "type": "anytls"}}})
+	fakeSupervisor := newFakeProcessSupervisor()
+	fakeSupervisor.states[singBoxProcessName] = supervisor.StateRunning
+	manager := &Manager{
+		cfg: config.Config{
+			SingBoxConfigPath:   configPath,
+			SingBoxLastGoodPath: lastGoodPath,
+			SingBoxV2RayAPIPort: 61002,
+		},
+		state:      runtimeState,
+		supervisor: fakeSupervisor,
+		singStats:  &fakeStatsClient{},
+		runCommand: func(context.Context, string, ...string) ([]byte, error) {
+			return []byte("parse error at inbounds[0]"), errors.New("exit status 1")
+		},
+	}
+
+	err := manager.restartSingBox(context.Background(), map[string]any{
+		"inbounds": []any{map[string]any{"tag": "new", "type": "anytls"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "configuration preflight failed") || !strings.Contains(err.Error(), "parse error") {
+		t.Fatalf("unexpected preflight error: %v", err)
+	}
+	gotBytes, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(gotBytes) != string(oldBytes) {
+		t.Fatalf("live configuration changed after preflight failure: %s", gotBytes)
+	}
+	if len(fakeSupervisor.stops) != 0 || len(fakeSupervisor.starts) != 0 {
+		t.Fatalf("preflight failure touched processes: stops=%v starts=%v", fakeSupervisor.stops, fakeSupervisor.starts)
+	}
+	if got := stringValue(asMapSlice(runtimeState.SingBoxConfig()["inbounds"])[0]["tag"]); got != "old" {
+		t.Fatalf("runtime configuration changed after preflight failure: %q", got)
+	}
+	if manager.singBoxApplyResult["status"] != "REJECTED" || manager.singBoxApplyResult["rollback"] != "NOT_REQUIRED" {
+		t.Fatalf("unexpected rejected apply metadata: %#v", manager.singBoxApplyResult)
+	}
+	if manager.singBoxApplyResult["activeHash"] == manager.singBoxApplyResult["requestedHash"] {
+		t.Fatalf("rejected config must not become active: %#v", manager.singBoxApplyResult)
+	}
+}
+
+func TestRestartSingBoxCommitsCandidateAndLastKnownGood(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "sing-box.json")
+	lastGoodPath := filepath.Join(dir, "sing-box.last-good.json")
+	if err := os.WriteFile(configPath, []byte(`{"inbounds":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := state.New("test")
+	runtimeState.SetSingBoxConfig(map[string]any{"inbounds": []any{}})
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.SetOnlineStatus(false, true)
+	fakeSupervisor := newFakeProcessSupervisor()
+	fakeSupervisor.states[singBoxProcessName] = supervisor.StateRunning
+	manager := &Manager{
+		cfg: config.Config{
+			SingBoxConfigPath:   configPath,
+			SingBoxLastGoodPath: lastGoodPath,
+			SingBoxV2RayAPIPort: 61002,
+		},
+		state:              runtimeState,
+		supervisor:         fakeSupervisor,
+		singStats:          &fakeStatsClient{},
+		runCommand:         func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
+		healthTimeout:      100 * time.Millisecond,
+		healthPollInterval: time.Millisecond,
+	}
+
+	if err := manager.restartSingBox(context.Background(), map[string]any{
+		"inbounds": []any{map[string]any{"tag": "new", "type": "anytls", "users": []any{}}},
+	}); err != nil {
+		t.Fatalf("restartSingBox() error = %v", err)
+	}
+	liveBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastGoodBytes, err := os.ReadFile(lastGoodPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(liveBytes) != string(lastGoodBytes) {
+		t.Fatalf("last-known-good does not match active config\nlive=%s\nlast-good=%s", liveBytes, lastGoodBytes)
+	}
+	if got := stringValue(asMapSlice(runtimeState.SingBoxConfig()["inbounds"])[0]["tag"]); got != "new" {
+		t.Fatalf("runtime configuration was not committed: %q", got)
+	}
+	if runtimeState.RunningCoreType() != state.CoreTypeSingBox {
+		t.Fatalf("running core = %q, want SING_BOX", runtimeState.RunningCoreType())
+	}
+	if manager.singBoxApplyResult["status"] != "APPLIED" || manager.singBoxApplyResult["activeHash"] != manager.singBoxApplyResult["requestedHash"] || manager.singBoxApplyResult["appliedAt"] == nil {
+		t.Fatalf("unexpected successful apply metadata: %#v", manager.singBoxApplyResult)
+	}
+}
+
+func TestRestartSingBoxRollsBackAfterHealthFailure(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "sing-box.json")
+	lastGoodPath := filepath.Join(dir, "sing-box.last-good.json")
+	oldBytes := []byte(`{"inbounds":[{"tag":"old","type":"anytls"}]}`)
+	if err := os.WriteFile(configPath, oldBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig := map[string]any{"inbounds": []any{map[string]any{"tag": "old", "type": "anytls"}}}
+	runtimeState := state.New("test")
+	runtimeState.SetSingBoxConfig(oldConfig)
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.SetOnlineStatus(false, true)
+	runtimeState.SetSingBoxConfig(map[string]any{"inbounds": []any{map[string]any{"tag": "new", "type": "anytls"}}})
+	fakeSupervisor := newFakeProcessSupervisor()
+	fakeSupervisor.states[singBoxProcessName] = supervisor.StateRunning
+	manager := &Manager{
+		cfg: config.Config{
+			SingBoxConfigPath:   configPath,
+			SingBoxLastGoodPath: lastGoodPath,
+			SingBoxV2RayAPIPort: 61002,
+		},
+		state:              runtimeState,
+		supervisor:         fakeSupervisor,
+		singStats:          &fakeStatsClient{systemErr: errors.New("connection refused")},
+		runCommand:         func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
+		healthTimeout:      10 * time.Millisecond,
+		healthPollInterval: time.Millisecond,
+	}
+
+	err := manager.restartSingBox(context.Background(), map[string]any{
+		"inbounds": []any{map[string]any{"tag": "new", "type": "anytls"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "failed health confirmation") || !strings.Contains(err.Error(), "previous configuration and core restored") {
+		t.Fatalf("unexpected activation error: %v", err)
+	}
+	gotBytes, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(gotBytes) != string(oldBytes) {
+		t.Fatalf("live configuration was not rolled back: %s", gotBytes)
+	}
+	lastGoodBytes, readErr := os.ReadFile(lastGoodPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(lastGoodBytes) != string(oldBytes) {
+		t.Fatalf("last-known-good was not preserved: %s", lastGoodBytes)
+	}
+	if got := stringValue(asMapSlice(runtimeState.SingBoxConfig()["inbounds"])[0]["tag"]); got != "old" {
+		t.Fatalf("runtime configuration was not rolled back: %q", got)
+	}
+	if len(fakeSupervisor.starts) != 2 || fakeSupervisor.starts[0] != singBoxProcessName || fakeSupervisor.starts[1] != singBoxProcessName {
+		t.Fatalf("expected activation and rollback starts, got %v", fakeSupervisor.starts)
+	}
+	if manager.singBoxApplyResult["status"] != "ROLLED_BACK" || manager.singBoxApplyResult["rollback"] != "SUCCEEDED" {
+		t.Fatalf("unexpected rollback apply metadata: %#v", manager.singBoxApplyResult)
+	}
+}
 
 func TestShouldRestartCoreIncludesCoreStatusAndConfiguration(t *testing.T) {
 	hashes := state.StartHashes{

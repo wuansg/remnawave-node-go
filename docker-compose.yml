@@ -22,6 +22,8 @@ services:
       SUPERVISORD_PID_PATH: ${SUPERVISORD_PID_PATH:-/run/remnawave/supervisord.pid}
       XRAY_CONFIG_PATH: ${XRAY_CONFIG_PATH:-/run/remnawave/xray.json}
       SING_BOX_CONFIG_PATH: ${SING_BOX_CONFIG_PATH:-/run/remnawave/sing-box.json}
+      SING_BOX_BINARY_PATH: ${SING_BOX_BINARY_PATH:-/usr/local/bin/sing-box}
+      SING_BOX_LAST_GOOD_CONFIG_PATH: ${SING_BOX_LAST_GOOD_CONFIG_PATH:-/var/lib/remnanode/sing-box.last-good.json}
       USAGE_SNAPSHOT_DB_PATH: ${USAGE_SNAPSHOT_DB_PATH:-/var/lib/remnanode/stats.db}
       FORWARDING_STATE_PATH: ${FORWARDING_STATE_PATH:-/var/lib/remnanode/forwarding.json}
     volumes:

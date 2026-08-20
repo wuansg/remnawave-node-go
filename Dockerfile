@@ -1,6 +1,6 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
-ARG REMNAWAVE_NODE_VERSION=3.3.0
+ARG REMNAWAVE_NODE_VERSION=3.3.1
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -77,6 +77,10 @@ COPY --from=xray-build /usr/local/share/xray/geoip.dat /usr/local/share/xray/geo
 COPY --from=xray-build /usr/local/share/xray/geosite.dat /usr/local/share/xray/geosite.dat
 COPY --from=sing-box-build /usr/local/bin/sing-box /usr/local/bin/sing-box
 
+RUN printf '%s\n' '{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}' > /tmp/sing-box-smoke.json \
+	&& /usr/local/bin/sing-box check -c /tmp/sing-box-smoke.json \
+	&& rm /tmp/sing-box-smoke.json
+
 COPY supervisord.conf /etc/supervisord.conf
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
@@ -95,6 +99,8 @@ ENV SING_BOX_V2RAY_API_PORT=61002
 ENV SING_BOX_VERSION=${SING_BOX_VERSION}
 ENV XRAY_CONFIG_PATH=/run/remnawave/xray.json
 ENV SING_BOX_CONFIG_PATH=/run/remnawave/sing-box.json
+ENV SING_BOX_BINARY_PATH=/usr/local/bin/sing-box
+ENV SING_BOX_LAST_GOOD_CONFIG_PATH=/var/lib/remnanode/sing-box.last-good.json
 ENV USAGE_SNAPSHOT_DB_PATH=/var/lib/remnanode/stats.db
 ENV FORWARDING_STATE_PATH=/var/lib/remnanode/forwarding.json
 

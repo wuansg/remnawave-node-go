@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-var buildVersion = "3.3.0"
+var buildVersion = "3.3.1"
 
 type Config struct {
 	NodePort              int
@@ -30,6 +30,8 @@ type Config struct {
 	SupervisordUser       string
 	SupervisordPass       string
 	SingBoxConfigPath     string
+	SingBoxBinaryPath     string
+	SingBoxLastGoodPath   string
 	NodePayload           NodePayload
 	NodeVersion           string
 	UsageSnapshotDBPath   string
@@ -71,6 +73,8 @@ func Load() (Config, error) {
 		SupervisordUser:       os.Getenv("SUPERVISORD_USER"),
 		SupervisordPass:       os.Getenv("SUPERVISORD_PASSWORD"),
 		SingBoxConfigPath:     envString("SING_BOX_CONFIG_PATH", "/run/remnawave/sing-box.json"),
+		SingBoxBinaryPath:     envString("SING_BOX_BINARY_PATH", "/usr/local/bin/sing-box"),
+		SingBoxLastGoodPath:   envString("SING_BOX_LAST_GOOD_CONFIG_PATH", "/var/lib/remnanode/sing-box.last-good.json"),
 		NodePayload:           payload,
 		NodeVersion:           detectVersion(),
 		UsageSnapshotDBPath:   envString("USAGE_SNAPSHOT_DB_PATH", "/var/lib/remnanode/stats.db"),

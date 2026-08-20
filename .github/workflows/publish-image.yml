@@ -13,10 +13,30 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  REMNAWAVE_NODE_VERSION: 3.3.0
+  REMNAWAVE_NODE_VERSION: 3.3.1
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.4'
+          cache: true
+
+      - name: Unit and race tests
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
   docker:
+    needs: test
     runs-on: ubuntu-latest
 
     steps:

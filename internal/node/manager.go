@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -65,7 +66,7 @@ type Manager struct {
 	cfg                config.Config
 	state              *state.Runtime
 	logger             *slog.Logger
-	supervisor         *supervisor.Client
+	supervisor         processSupervisor
 	network            *system.NetworkMonitor
 	nftReady           bool
 	startedAt          time.Time
@@ -79,7 +80,24 @@ type Manager struct {
 	forwarding         *forwarding.Service
 	usageMu            sync.Mutex
 	usageCoreRestarted bool
+	runCommand         commandRunner
+	healthTimeout      time.Duration
+	healthPollInterval time.Duration
+	singBoxApplyResult map[string]any
 }
+
+type processSupervisor interface {
+	StartProcess(context.Context, string) error
+	StopProcess(context.Context, string) error
+	GetProcessInfo(context.Context, string) (supervisor.ProcessInfo, error)
+}
+
+type commandRunner func(context.Context, string, ...string) ([]byte, error)
+
+const (
+	defaultSingBoxHealthTimeout      = 10 * time.Second
+	defaultSingBoxHealthPollInterval = 250 * time.Millisecond
+)
 
 type StartRequest struct {
 	CoreType      string         `json:"coreType"`
@@ -248,20 +266,23 @@ func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Log
 		return nil, err
 	}
 	manager := &Manager{
-		cfg:            cfg,
-		state:          runtimeState,
-		logger:         logger,
-		supervisor:     client,
-		network:        network,
-		nftReady:       commandExists("nft") && hasNetAdmin(),
-		startedAt:      time.Now(),
-		apiTLS:         bundle,
-		xrayStats:      xrayStats,
-		singStats:      singStats,
-		xrayHandle:     xrayHandler,
-		xrayRoute:      xrayRouting,
-		usageSnapshots: usageSnapshots,
-		forwarding:     forwarding.New(cfg.ForwardingStatePath, cfg.NodePort, logger),
+		cfg:                cfg,
+		state:              runtimeState,
+		logger:             logger,
+		supervisor:         client,
+		network:            network,
+		nftReady:           commandExists("nft") && hasNetAdmin(),
+		startedAt:          time.Now(),
+		apiTLS:             bundle,
+		xrayStats:          xrayStats,
+		singStats:          singStats,
+		xrayHandle:         xrayHandler,
+		xrayRoute:          xrayRouting,
+		usageSnapshots:     usageSnapshots,
+		forwarding:         forwarding.New(cfg.ForwardingStatePath, cfg.NodePort, logger),
+		runCommand:         runCombinedOutput,
+		healthTimeout:      defaultSingBoxHealthTimeout,
+		healthPollInterval: defaultSingBoxHealthPollInterval,
 	}
 	if err := manager.forwarding.Restore(context.Background()); err != nil {
 		logger.Error("failed to restore forwarding rules", "error", err)
@@ -333,22 +354,24 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 	case state.CoreTypeSingBox:
 		config := applySingBoxAPIConfig(normalizeSingBoxKeys(cloneMap(request.SingBoxConfig)), m.cfg)
 		if len(config) == 0 {
-			return wrapStartResponse(false, nil, ptrString("singBoxConfig is required for SING_BOX core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
+			return wrapStartResponse(false, nil, ptrString("singBoxConfig is required for SING_BOX core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), nil)
 		}
 		if err := m.forwarding.ValidateCoreConfig(string(coreType), config); err != nil {
 			return m.coreConflictResponse(ctx, err)
 		}
 		shouldRestart = shouldRestart || !reflect.DeepEqual(m.state.SingBoxConfig(), config)
-		m.state.SetSingBoxConfig(config)
 		if shouldRestart {
 			if err := m.restartSingBox(ctx, config); err != nil {
-				return wrapStartResponse(false, nil, ptrString(err.Error()), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
+				return m.coreActivationFailureResponse(ctx, err, snapshot)
 			}
+		} else {
+			m.state.SetSingBoxConfig(config)
+			m.recordUnchangedSingBoxConfig(config)
 		}
 	case state.CoreTypeXRAY:
 		config := applyXrayAPIConfig(cloneMap(request.XrayConfig), m.cfg, m.state.PluginState(), m.apiTLS)
 		if len(config) == 0 {
-			return wrapStartResponse(false, nil, ptrString("xrayConfig is required for XRAY core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
+			return wrapStartResponse(false, nil, ptrString("xrayConfig is required for XRAY core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), nil)
 		}
 		if err := m.forwarding.ValidateCoreConfig(string(coreType), config); err != nil {
 			return m.coreConflictResponse(ctx, err)
@@ -357,7 +380,7 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 		m.state.SetXrayConfig(config)
 		if shouldRestart {
 			if err := m.restartXray(ctx); err != nil {
-				return wrapStartResponse(false, nil, ptrString(err.Error()), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
+				return wrapStartResponse(false, nil, ptrString(err.Error()), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), nil)
 			}
 		}
 	}
@@ -375,7 +398,18 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 		m.usageCoreRestarted = true
 		m.usageMu.Unlock()
 	}
-	return wrapStartResponse(started, m.activeVersion(coreType), nil, m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions())
+	return wrapStartResponse(started, m.activeVersion(coreType), nil, m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), m.startConfigApplyResult(coreType))
+}
+
+func (m *Manager) coreActivationFailureResponse(ctx context.Context, err error, snapshot system.Snapshot) map[string]any {
+	m.refreshOnlineStatus(ctx)
+	running := m.state.RunningCoreType()
+	xrayOnline, singBoxOnline := m.state.OnlineStatus()
+	started := xrayOnline
+	if running == state.CoreTypeSingBox {
+		started = singBoxOnline
+	}
+	return wrapStartResponse(started, m.activeVersion(running), ptrString(err.Error()), m.state.NodeVersion(), snapshot, string(running), m.coreVersions(), m.singBoxApplyResult)
 }
 
 func (m *Manager) coreConflictResponse(ctx context.Context, err error) map[string]any {
@@ -386,7 +420,7 @@ func (m *Manager) coreConflictResponse(ctx context.Context, err error) map[strin
 	if running == state.CoreTypeSingBox {
 		started = singBoxOnline
 	}
-	return wrapStartResponse(started, m.activeVersion(running), ptrString(err.Error()), m.state.NodeVersion(), system.SystemSnapshot(m.network), string(running), m.coreVersions())
+	return wrapStartResponse(started, m.activeVersion(running), ptrString(err.Error()), m.state.NodeVersion(), system.SystemSnapshot(m.network), string(running), m.coreVersions(), nil)
 }
 
 func (m *Manager) shouldRestartCore(coreType state.CoreType, force bool, hashes state.StartHashes) bool {
@@ -1231,25 +1265,358 @@ func (m *Manager) restartXray(ctx context.Context) error {
 
 func (m *Manager) restartSingBox(ctx context.Context, config map[string]any) error {
 	config = applySingBoxAPIConfig(cloneMap(config), m.cfg)
-	m.state.SetSingBoxConfig(config)
-	if err := os.MkdirAll(filepath.Dir(m.cfg.SingBoxConfigPath), 0o755); err != nil {
-		return err
+	configPath := m.cfg.SingBoxConfigPath
+	if configPath == "" {
+		configPath = "/run/remnawave/sing-box.json"
+	}
+	configDir := filepath.Dir(configPath)
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return fmt.Errorf("create sing-box configuration directory: %w", err)
 	}
 	encoded, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
+		return fmt.Errorf("encode sing-box configuration: %w", err)
+	}
+	attemptedAt := time.Now().UTC()
+	requestedHash := hashConfigBytes(encoded)
+	m.singBoxApplyResult = newSingBoxApplyResult("PENDING", requestedHash, "", attemptedAt, nil, "NOT_REQUIRED")
+
+	candidatePath, err := writeCandidateFile(configPath, encoded)
+	if err != nil {
+		m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, "", attemptedAt, nil, "NOT_REQUIRED")
+		return fmt.Errorf("write sing-box candidate configuration: %w", err)
+	}
+	candidateOwned := true
+	defer func() {
+		if candidateOwned {
+			_ = os.Remove(candidatePath)
+		}
+	}()
+
+	previousCore := m.state.RunningCoreType()
+	previousConfig, hadPreviousConfig, err := readOptionalFile(configPath)
+	if err != nil {
+		m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, "", attemptedAt, nil, "NOT_REQUIRED")
+		return fmt.Errorf("read current sing-box configuration: %w", err)
+	}
+	previousRuntimeConfig := m.state.SingBoxConfig()
+	if previousCore == state.CoreTypeSingBox && hadPreviousConfig {
+		if err := json.Unmarshal(previousConfig, &previousRuntimeConfig); err != nil {
+			m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, "", attemptedAt, nil, "NOT_REQUIRED")
+			return fmt.Errorf("decode current sing-box configuration for rollback: %w", err)
+		}
+	}
+	previousHash := ""
+	if hadPreviousConfig {
+		previousHash = hashConfigBytes(previousConfig)
+	}
+	lastGoodPath := m.singBoxLastGoodPath(configPath)
+
+	if err := m.checkSingBoxConfig(ctx, candidatePath); err != nil {
+		if previousCore == state.CoreTypeSingBox && hadPreviousConfig {
+			m.state.SetSingBoxConfig(previousRuntimeConfig)
+		}
+		m.singBoxApplyResult = newSingBoxApplyResult("REJECTED", requestedHash, previousHash, attemptedAt, nil, "NOT_REQUIRED")
 		return err
 	}
-	if err := os.WriteFile(m.cfg.SingBoxConfigPath, encoded, 0o644); err != nil {
-		return err
+
+	if previousCore == state.CoreTypeSingBox && hadPreviousConfig {
+		if err := writeFileAtomic(lastGoodPath, previousConfig, 0o600); err != nil {
+			m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, previousHash, attemptedAt, nil, "NOT_REQUIRED")
+			return fmt.Errorf("save current sing-box configuration as last-known-good: %w", err)
+		}
 	}
+
+	if err := os.Chmod(candidatePath, 0o644); err != nil {
+		m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, previousHash, attemptedAt, nil, "NOT_REQUIRED")
+		return fmt.Errorf("set sing-box candidate permissions: %w", err)
+	}
+	if err := os.Rename(candidatePath, configPath); err != nil {
+		m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, previousHash, attemptedAt, nil, "NOT_REQUIRED")
+		return fmt.Errorf("activate sing-box candidate configuration: %w", err)
+	}
+	candidateOwned = false
+	if err := syncDirectory(configDir); err != nil {
+		restoreErr := restoreOptionalFile(configPath, previousConfig, hadPreviousConfig, 0o644)
+		if restoreErr != nil {
+			m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, previousHash, attemptedAt, nil, "FAILED")
+			return fmt.Errorf("sync sing-box configuration directory: %w; restore current configuration: %v", err, restoreErr)
+		}
+		m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, previousHash, attemptedAt, nil, "SUCCEEDED")
+		return fmt.Errorf("sync sing-box configuration directory: %w", err)
+	}
+
 	_ = m.supervisor.StopProcess(ctx, xrayProcessName)
 	_ = m.supervisor.StopProcess(ctx, singBoxProcessName)
 	if err := m.supervisor.StartProcess(ctx, singBoxProcessName); err != nil {
-		return err
+		return m.failSingBoxActivation(ctx, fmt.Errorf("start sing-box: %w", err), requestedHash, previousHash, attemptedAt, previousCore, previousRuntimeConfig, previousConfig, hadPreviousConfig, configPath, lastGoodPath)
 	}
+	if err := m.waitForSingBoxHealthy(ctx); err != nil {
+		return m.failSingBoxActivation(ctx, err, requestedHash, previousHash, attemptedAt, previousCore, previousRuntimeConfig, previousConfig, hadPreviousConfig, configPath, lastGoodPath)
+	}
+	if err := writeFileAtomic(lastGoodPath, encoded, 0o600); err != nil {
+		return m.failSingBoxActivation(ctx, fmt.Errorf("persist sing-box last-known-good configuration: %w", err), requestedHash, previousHash, attemptedAt, previousCore, previousRuntimeConfig, previousConfig, hadPreviousConfig, configPath, lastGoodPath)
+	}
+	appliedAt := time.Now().UTC()
+	m.singBoxApplyResult = newSingBoxApplyResult("APPLIED", requestedHash, requestedHash, attemptedAt, &appliedAt, "NOT_REQUIRED")
+	m.state.SetSingBoxConfig(config)
 	m.state.SetRunningCore(state.CoreTypeSingBox)
 	m.refreshOnlineStatus(ctx)
 	return nil
+}
+
+func (m *Manager) checkSingBoxConfig(ctx context.Context, path string) error {
+	binary := m.cfg.SingBoxBinaryPath
+	if binary == "" {
+		binary = "/usr/local/bin/sing-box"
+	}
+	runner := m.runCommand
+	if runner == nil {
+		runner = runCombinedOutput
+	}
+	output, err := runner(ctx, binary, "check", "-c", path)
+	if err == nil {
+		return nil
+	}
+	message := strings.TrimSpace(string(output))
+	if len(message) > 2048 {
+		message = message[:2048] + "..."
+	}
+	if message == "" {
+		return fmt.Errorf("sing-box configuration preflight failed: %w", err)
+	}
+	return fmt.Errorf("sing-box configuration preflight failed: %w: %s", err, message)
+}
+
+func (m *Manager) waitForSingBoxHealthy(ctx context.Context) error {
+	timeout := m.healthTimeout
+	if timeout <= 0 {
+		timeout = defaultSingBoxHealthTimeout
+	}
+	interval := m.healthPollInterval
+	if interval <= 0 {
+		interval = defaultSingBoxHealthPollInterval
+	}
+	healthCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		info, err := m.supervisor.GetProcessInfo(healthCtx, singBoxProcessName)
+		if err != nil {
+			lastErr = fmt.Errorf("query supervisord: %w", err)
+		} else if info.State == supervisor.StateRunning {
+			if m.singStats == nil {
+				lastErr = errors.New("sing-box internal statistics API client is unavailable")
+			} else if _, err := m.singStats.System(healthCtx); err != nil {
+				lastErr = fmt.Errorf("sing-box internal statistics API is unavailable: %w", err)
+			} else {
+				return nil
+			}
+		} else {
+			lastErr = fmt.Errorf("supervisord reports sing-box state %s (%d): %s", info.StateName, info.State, info.Raw)
+			if info.State == supervisor.StateFatal || info.State == supervisor.StateExited || info.State == supervisor.StateStopped {
+				return fmt.Errorf("sing-box failed health confirmation: %w", lastErr)
+			}
+		}
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-healthCtx.Done():
+			timer.Stop()
+			if lastErr == nil {
+				lastErr = healthCtx.Err()
+			}
+			return fmt.Errorf("sing-box failed health confirmation: %w", lastErr)
+		case <-timer.C:
+		}
+	}
+}
+
+func (m *Manager) failSingBoxActivation(ctx context.Context, activationErr error, requestedHash, previousHash string, attemptedAt time.Time, previousCore state.CoreType, previousRuntimeConfig map[string]any, previousConfig []byte, hadPreviousConfig bool, configPath, lastGoodPath string) error {
+	rollbackErr := m.rollbackSingBox(ctx, previousCore, previousRuntimeConfig, previousConfig, hadPreviousConfig, configPath, lastGoodPath)
+	if rollbackErr != nil {
+		m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, previousHash, attemptedAt, nil, "FAILED")
+		return fmt.Errorf("%w; rollback failed: %v", activationErr, rollbackErr)
+	}
+	if previousCore == "" && !hadPreviousConfig {
+		m.singBoxApplyResult = newSingBoxApplyResult("FAILED", requestedHash, "", attemptedAt, nil, "NOT_AVAILABLE")
+		return fmt.Errorf("%w; first activation failed and no previous configuration or core was available", activationErr)
+	}
+	rolledBackAt := time.Now().UTC()
+	m.singBoxApplyResult = newSingBoxApplyResult("ROLLED_BACK", requestedHash, previousHash, attemptedAt, &rolledBackAt, "SUCCEEDED")
+	return fmt.Errorf("%w; previous configuration and core restored", activationErr)
+}
+
+func (m *Manager) rollbackSingBox(ctx context.Context, previousCore state.CoreType, previousRuntimeConfig map[string]any, previousConfig []byte, hadPreviousConfig bool, configPath, lastGoodPath string) error {
+	_ = m.supervisor.StopProcess(ctx, singBoxProcessName)
+
+	restoreErr := restoreOptionalFile(configPath, previousConfig, hadPreviousConfig, 0o644)
+	if !hadPreviousConfig {
+		lastGood, exists, err := readOptionalFile(lastGoodPath)
+		if err != nil {
+			restoreErr = err
+		} else if previousCore == state.CoreTypeSingBox && exists {
+			restoreErr = writeFileAtomic(configPath, lastGood, 0o644)
+		}
+	}
+	if restoreErr == nil && previousCore == state.CoreTypeSingBox && hadPreviousConfig {
+		restoreErr = writeFileAtomic(lastGoodPath, previousConfig, 0o600)
+	}
+	if restoreErr != nil {
+		m.state.SetRunningCore("")
+		m.refreshOnlineStatus(ctx)
+		return fmt.Errorf("restore sing-box configuration: %w", restoreErr)
+	}
+
+	var startErr error
+	switch previousCore {
+	case state.CoreTypeSingBox:
+		m.state.SetSingBoxConfig(previousRuntimeConfig)
+		startErr = m.supervisor.StartProcess(ctx, singBoxProcessName)
+	case state.CoreTypeXRAY:
+		startErr = m.supervisor.StartProcess(ctx, xrayProcessName)
+	}
+	if startErr != nil {
+		m.state.SetRunningCore("")
+		m.refreshOnlineStatus(ctx)
+		return fmt.Errorf("restart previous %s core: %w", previousCore, startErr)
+	}
+	m.state.SetRunningCore(previousCore)
+	m.refreshOnlineStatus(ctx)
+	return nil
+}
+
+func (m *Manager) singBoxLastGoodPath(configPath string) string {
+	if m.cfg.SingBoxLastGoodPath != "" {
+		return m.cfg.SingBoxLastGoodPath
+	}
+	return configPath + ".last-good"
+}
+
+func (m *Manager) recordUnchangedSingBoxConfig(config map[string]any) {
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		m.singBoxApplyResult = nil
+		return
+	}
+	now := time.Now().UTC()
+	hash := hashConfigBytes(encoded)
+	m.singBoxApplyResult = newSingBoxApplyResult("UNCHANGED", hash, hash, now, nil, "NOT_REQUIRED")
+}
+
+func (m *Manager) startConfigApplyResult(coreType state.CoreType) map[string]any {
+	if coreType != state.CoreTypeSingBox || m.singBoxApplyResult == nil {
+		return nil
+	}
+	return cloneMap(m.singBoxApplyResult)
+}
+
+func newSingBoxApplyResult(status, requestedHash, activeHash string, attemptedAt time.Time, appliedAt *time.Time, rollback string) map[string]any {
+	result := map[string]any{
+		"status":        status,
+		"requestedHash": requestedHash,
+		"activeHash":    nil,
+		"attemptedAt":   attemptedAt.Format(time.RFC3339Nano),
+		"appliedAt":     nil,
+		"rollback":      rollback,
+	}
+	if activeHash != "" {
+		result["activeHash"] = activeHash
+	}
+	if appliedAt != nil {
+		result["appliedAt"] = appliedAt.Format(time.RFC3339Nano)
+	}
+	return result
+}
+
+func hashConfigBytes(data []byte) string {
+	var decoded any
+	if err := json.Unmarshal(data, &decoded); err == nil {
+		if canonical, err := json.Marshal(decoded); err == nil {
+			data = canonical
+		}
+	}
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}
+
+func writeCandidateFile(targetPath string, data []byte) (string, error) {
+	dir := filepath.Dir(targetPath)
+	file, err := os.CreateTemp(dir, "."+filepath.Base(targetPath)+".candidate-*")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	remove := true
+	defer func() {
+		_ = file.Close()
+		if remove {
+			_ = os.Remove(path)
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		return "", err
+	}
+	if _, err := file.Write(data); err != nil {
+		return "", err
+	}
+	if err := file.Sync(); err != nil {
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	remove = false
+	return path, nil
+}
+
+func writeFileAtomic(targetPath string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return err
+	}
+	temporaryPath, err := writeCandidateFile(targetPath, data)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(temporaryPath)
+	if err := os.Chmod(temporaryPath, mode); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, targetPath); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(targetPath))
+}
+
+func readOptionalFile(path string) ([]byte, bool, error) {
+	data, err := os.ReadFile(path)
+	if err == nil {
+		return data, true, nil
+	}
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	return nil, false, err
+}
+
+func restoreOptionalFile(path string, data []byte, exists bool, mode os.FileMode) error {
+	if exists {
+		return writeFileAtomic(path, data, mode)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func (m *Manager) refreshOnlineStatus(ctx context.Context) {
@@ -2117,19 +2484,23 @@ func normalizeSingBoxType(value string) string {
 	return value
 }
 
-func wrapStartResponse(started bool, version *string, err *string, nodeVersion string, snapshot system.Snapshot, runningCore string, versions map[string]any) map[string]any {
-	return map[string]any{
-		"response": map[string]any{
-			"isStarted":    started,
-			"version":      derefString(version),
-			"runningCore":  runningCore,
-			"coreVersions": versions,
-			"error":        derefString(err),
-			"nodeInformation": map[string]any{
-				"version": nodeVersion,
-			},
-			"system": snapshot,
+func wrapStartResponse(started bool, version *string, err *string, nodeVersion string, snapshot system.Snapshot, runningCore string, versions map[string]any, configApply map[string]any) map[string]any {
+	response := map[string]any{
+		"isStarted":    started,
+		"version":      derefString(version),
+		"runningCore":  runningCore,
+		"coreVersions": versions,
+		"error":        derefString(err),
+		"nodeInformation": map[string]any{
+			"version": nodeVersion,
 		},
+		"system": snapshot,
+	}
+	if configApply != nil {
+		response["configApply"] = cloneMap(configApply)
+	}
+	return map[string]any{
+		"response": response,
 	}
 }
 
