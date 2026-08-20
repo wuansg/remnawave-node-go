@@ -90,6 +90,19 @@ type Status struct {
 	Rules                   []RuleStatus `json:"rules"`
 }
 
+// RuntimeSummary is the lightweight forwarding state included in the node
+// health response. It deliberately omits nftables counters so frequent health
+// checks do not compete with traffic collection endpoints.
+type RuntimeSummary struct {
+	State           string            `json:"state"`
+	ConfigHash      string            `json:"configHash,omitempty"`
+	LastSyncedAt    *time.Time        `json:"lastSyncedAt,omitempty"`
+	LastError       string            `json:"lastError,omitempty"`
+	ConfiguredRules int               `json:"configuredRules"`
+	EnabledRules    int               `json:"enabledRules"`
+	DNSResults      map[string]string `json:"dnsResults"`
+}
+
 type ConflictError struct {
 	Protocol      Protocol `json:"protocol"`
 	Port          int      `json:"port"`
@@ -230,6 +243,21 @@ func (s *Service) Status(ctx context.Context) Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.statusLocked(ctx)
+}
+
+func (s *Service) RuntimeSummary(ctx context.Context) RuntimeSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, lastError := s.runtimeStateLocked(ctx)
+	return RuntimeSummary{
+		State:           state,
+		ConfigHash:      s.appliedHash,
+		LastSyncedAt:    s.appliedAt,
+		LastError:       lastError,
+		ConfiguredRules: len(s.applied.Rules),
+		EnabledRules:    enabledRuleCount(s.applied),
+		DNSResults:      cloneStringMap(s.resolved),
+	}
 }
 
 // RefreshDNS reapplies forwarding only when an enabled hostname resolves to a
@@ -420,19 +448,10 @@ func (s *Service) validateLocked(ctx context.Context, cfg Config, coreListeners 
 }
 
 func (s *Service) statusLocked(ctx context.Context) Status {
-	state := "disabled"
-	if s.applied.Enabled && enabledRuleCount(s.applied) > 0 {
-		state = "applied"
-		if !s.tableMatches(ctx, s.appliedHash) {
-			state = "error"
-		}
-	}
-	if s.lastError != "" {
-		state = "error"
-	}
+	state, lastError := s.runtimeStateLocked(ctx)
 	status := Status{
 		State: state, AppliedHash: s.appliedHash, AppliedAt: s.appliedAt,
-		ResolvedListenInterface: s.iface, LastError: s.lastError,
+		ResolvedListenInterface: s.iface, LastError: lastError,
 		ForwardingEnabled: readIPv4Forwarding(), FirewallForwardPolicy: firewallForwardPolicy(ctx),
 		Rules: []RuleStatus{},
 	}
@@ -457,6 +476,28 @@ func (s *Service) statusLocked(ctx context.Context) Status {
 		status.Rules = append(status.Rules, item)
 	}
 	return status
+}
+
+func (s *Service) runtimeStateLocked(ctx context.Context) (string, string) {
+	state := "disabled"
+	lastError := s.lastError
+	if s.applied.Enabled && enabledRuleCount(s.applied) > 0 {
+		state = "applied"
+		if !s.tableMatches(ctx, s.appliedHash) {
+			state = "error"
+			if lastError == "" {
+				lastError = "applied nftables rules do not match the stored forwarding configuration"
+			}
+		}
+	}
+	if s.lastError != "" {
+		state = "error"
+	}
+	if state == "applied" && firewallForwardPolicy(ctx) == "drop" && !hostFirewallAllows(ctx, s.applied) {
+		state = "degraded"
+		lastError = "host FORWARD policy is drop; add explicit allow rules with remnanode-forward-host-allow comments for every forwarded flow"
+	}
+	return state, lastError
 }
 
 func (s *Service) persist(value persistedState) error {
@@ -614,6 +655,14 @@ func sameStringMap(left, right map[string]string) bool {
 		}
 	}
 	return true
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func enabledRuleCount(cfg Config) int {

@@ -18,6 +18,7 @@ import (
 	"github.com/remnawave/remnawave-node-go/internal/statname"
 	"github.com/remnawave/remnawave-node-go/internal/supervisor"
 	"github.com/remnawave/remnawave-node-go/internal/system"
+	"github.com/remnawave/remnawave-node-go/internal/usagesnapshot"
 )
 
 type fakeStatsClient struct {
@@ -25,9 +26,11 @@ type fakeStatsClient struct {
 	lastPattern string
 	lastReset   bool
 	systemErr   error
+	queryCalls  int
 }
 
 func (f *fakeStatsClient) Query(_ context.Context, pattern string, reset bool) ([]coreapi.Stat, error) {
+	f.queryCalls++
 	f.lastPattern, f.lastReset = pattern, reset
 	return f.stats, nil
 }
@@ -289,6 +292,28 @@ func TestShouldRestartCoreIncludesCoreStatusAndConfiguration(t *testing.T) {
 	manager.cfg = config.Config{DisableHashCheck: true}
 	if !manager.shouldRestartCore(state.CoreTypeXRAY, false, hashes) {
 		t.Fatal("disabled hash checks must force a restart")
+	}
+}
+
+func TestCaptureUsageSnapshotSkipsCorelessRuntime(t *testing.T) {
+	store, err := usagesnapshot.Open(filepath.Join(t.TempDir(), "snapshots.db"), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Activate(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &fakeStatsClient{}
+	manager := &Manager{
+		state:          state.New("test"),
+		xrayStats:      client,
+		usageSnapshots: store,
+	}
+	manager.CaptureUsageSnapshot(context.Background())
+	if client.queryCalls != 0 {
+		t.Fatalf("coreless capture queried stats %d times", client.queryCalls)
 	}
 }
 

@@ -450,26 +450,21 @@ func (m *Manager) Stop(ctx context.Context) map[string]any {
 
 func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 	m.refreshOnlineStatus(ctx)
-	xrayOnline, singBoxOnline := m.state.OnlineStatus()
-	runningCore := m.state.RunningCore()
-	coreOnline := xrayOnline
-	if runningCore == string(state.CoreTypeSingBox) {
-		coreOnline = singBoxOnline
-	}
-	var runningValue any
-	if runningCore != "" {
-		runningValue = runningCore
-	}
+	runtimeStatus := m.runtimeStatus(ctx)
 	return map[string]any{
 		"response": map[string]any{
 			"isAlive":                  true,
-			"xrayInternalStatusCached": coreOnline,
+			"xrayInternalStatusCached": runtimeStatus.CoreOnline,
 			"xrayVersion":              derefString(m.activeVersion(state.CoreTypeXRAY)),
-			"runningCore":              runningValue,
-			"supportedCores":           []string{string(state.CoreTypeXRAY), string(state.CoreTypeSingBox)},
+			"runningCore":              runtimeStatus.RunningCore,
+			"supportedCores":           runtimeStatus.SupportedCores,
 			"coreVersions":             m.coreVersions(),
 			"nodeVersion":              m.state.NodeVersion(),
-			"capabilities":             []string{usagesnapshot.Capability, forwarding.Capability, forwarding.DNSCapability},
+			"capabilities":             runtimeStatus.Capabilities,
+			"runtimeMode":              runtimeStatus.Mode,
+			"coreOnline":               runtimeStatus.CoreOnline,
+			"forwarding":               runtimeStatus.Forwarding,
+			"usageSnapshot":            runtimeStatus.UsageSnapshot,
 		},
 	}
 }
@@ -528,6 +523,12 @@ func (m *Manager) ActivateUsageSnapshots(ctx context.Context) (usagesnapshot.Sta
 
 func (m *Manager) CaptureUsageSnapshot(ctx context.Context) {
 	if !m.UsageSnapshotActive() {
+		return
+	}
+	// Forwarding-only and idle nodes intentionally have no core stats API. Keep
+	// the snapshot generation intact so it can resume with the next core, but do
+	// not emit a false warning on every capture tick.
+	if m.state.RunningCoreType() == "" {
 		return
 	}
 	counters, err := m.currentUsageCounters(ctx)

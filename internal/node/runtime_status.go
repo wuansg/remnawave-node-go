@@ -1,0 +1,92 @@
+package node
+
+import (
+	"context"
+
+	"github.com/remnawave/remnawave-node-go/internal/forwarding"
+	"github.com/remnawave/remnawave-node-go/internal/state"
+	"github.com/remnawave/remnawave-node-go/internal/usagesnapshot"
+)
+
+const (
+	RuntimeModeCapability = "runtime_mode_v1"
+	SingBoxCapability     = "core_sing_box_v1"
+	XrayCapability        = "core_xray_v1"
+)
+
+type RuntimeMode string
+
+const (
+	RuntimeModeCoreActive     RuntimeMode = "CORE_ACTIVE"
+	RuntimeModeForwardingOnly RuntimeMode = "FORWARDING_ONLY"
+	RuntimeModeIdle           RuntimeMode = "IDLE"
+	RuntimeModeDegraded       RuntimeMode = "DEGRADED"
+)
+
+type usageSnapshotRuntimeStatus struct {
+	Supported bool `json:"supported"`
+	Active    bool `json:"active"`
+}
+
+type agentRuntimeStatus struct {
+	Mode           RuntimeMode                `json:"mode"`
+	RunningCore    any                        `json:"runningCore"`
+	CoreOnline     bool                       `json:"coreOnline"`
+	Capabilities   []string                   `json:"capabilities"`
+	SupportedCores []string                   `json:"supportedCores"`
+	Forwarding     forwarding.RuntimeSummary  `json:"forwarding"`
+	UsageSnapshot  usageSnapshotRuntimeStatus `json:"usageSnapshot"`
+}
+
+func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
+	runningCore := m.state.RunningCoreType()
+	xrayOnline, singBoxOnline := m.state.OnlineStatus()
+	coreOnline := (runningCore == state.CoreTypeXRAY && xrayOnline) ||
+		(runningCore == state.CoreTypeSingBox && singBoxOnline)
+
+	forwardingStatus := forwarding.RuntimeSummary{
+		State:      "unsupported",
+		DNSResults: map[string]string{},
+	}
+	capabilities := []string{RuntimeModeCapability, XrayCapability, SingBoxCapability}
+	if m.forwarding != nil {
+		forwardingStatus = m.forwarding.RuntimeSummary(ctx)
+		capabilities = append(capabilities, forwarding.Capability, forwarding.DNSCapability)
+	}
+	usageStatus := usageSnapshotRuntimeStatus{Supported: m.usageSnapshots != nil}
+	if m.usageSnapshots != nil {
+		usageStatus.Active = m.usageSnapshots.Active()
+		capabilities = append(capabilities, usagesnapshot.Capability)
+	}
+
+	var runningValue any
+	if runningCore != "" {
+		runningValue = string(runningCore)
+	}
+
+	return agentRuntimeStatus{
+		Mode:           resolveRuntimeMode(runningCore, coreOnline, forwardingStatus.State),
+		RunningCore:    runningValue,
+		CoreOnline:     coreOnline,
+		Capabilities:   capabilities,
+		SupportedCores: []string{string(state.CoreTypeXRAY), string(state.CoreTypeSingBox)},
+		Forwarding:     forwardingStatus,
+		UsageSnapshot:  usageStatus,
+	}
+}
+
+func resolveRuntimeMode(runningCore state.CoreType, coreOnline bool, forwardingState string) RuntimeMode {
+	if forwardingState == "error" || forwardingState == "degraded" {
+		return RuntimeModeDegraded
+	}
+	if runningCore != "" {
+		if coreOnline {
+			return RuntimeModeCoreActive
+		}
+		return RuntimeModeDegraded
+	}
+	if forwardingState == "applied" {
+		return RuntimeModeForwardingOnly
+	}
+	return RuntimeModeIdle
+}
