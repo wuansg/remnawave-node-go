@@ -56,7 +56,9 @@ type PluginState struct {
 	ActivePlugin            *PluginMeta
 	ConnectionDropWhitelist map[string]struct{}
 	IngressBlocked          []string
+	EgressBlockedBaseIPs    []string
 	EgressBlockedIPs        []string
+	EgressBlockedDomains    []string
 	EgressBlockedPorts      []int
 	TorrentEnabled          bool
 	TorrentDuration         int
@@ -471,7 +473,9 @@ func (p PluginState) clone() PluginState {
 	out := PluginState{
 		ConfigHash:              p.ConfigHash,
 		IngressBlocked:          append([]string(nil), p.IngressBlocked...),
+		EgressBlockedBaseIPs:    append([]string(nil), p.EgressBlockedBaseIPs...),
 		EgressBlockedIPs:        append([]string(nil), p.EgressBlockedIPs...),
+		EgressBlockedDomains:    append([]string(nil), p.EgressBlockedDomains...),
 		EgressBlockedPorts:      append([]int(nil), p.EgressBlockedPorts...),
 		TorrentEnabled:          p.TorrentEnabled,
 		TorrentDuration:         p.TorrentDuration,

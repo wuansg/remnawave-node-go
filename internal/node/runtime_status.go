@@ -48,7 +48,7 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		State:      "unsupported",
 		DNSResults: map[string]string{},
 	}
-	capabilities := []string{RuntimeModeCapability, XrayCapability, SingBoxCapability}
+	capabilities := []string{RuntimeModeCapability, XrayCapability, SingBoxCapability, "geocheck_v1"}
 	if m.forwarding != nil {
 		forwardingStatus = m.forwarding.RuntimeSummary(ctx)
 		capabilities = append(capabilities, forwarding.Capability, forwarding.DNSCapability)

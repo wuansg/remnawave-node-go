@@ -1,6 +1,6 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
-ARG REMNAWAVE_NODE_VERSION=3.4.0
+ARG REMNAWAVE_NODE_VERSION=3.5.0
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -56,6 +56,22 @@ RUN apk add --no-cache git patch \
         -o /usr/local/bin/sing-box ./cmd/sing-box
 
 
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS geocheck
+
+ARG GEOCHECK_VERSION=0.3.0
+ARG GEOCHECK_RELEASE_URL=https://github.com/remnawave/geocheck/releases/download
+ARG TARGETARCH
+
+RUN apk add --no-cache curl \
+    && cd /tmp \
+    && ARCHIVE="geocheck_linux_${TARGETARCH}.tar.gz" \
+    && curl -fsSL -O "${GEOCHECK_RELEASE_URL}/v${GEOCHECK_VERSION}/${ARCHIVE}" \
+    && curl -fsSL -O "${GEOCHECK_RELEASE_URL}/v${GEOCHECK_VERSION}/checksums.txt" \
+    && grep "  ${ARCHIVE}$" checksums.txt | sha256sum -c - \
+    && tar -xzf "${ARCHIVE}" geocheck \
+    && install -m 0755 geocheck /usr/local/bin/geocheck
+
+
 FROM alpine:3.22
 
 ARG SING_BOX_VERSION=1.13.16
@@ -76,6 +92,7 @@ COPY --from=xray-build /usr/local/bin/xray /usr/local/bin/xray
 COPY --from=xray-build /usr/local/share/xray/geoip.dat /usr/local/share/xray/geoip.dat
 COPY --from=xray-build /usr/local/share/xray/geosite.dat /usr/local/share/xray/geosite.dat
 COPY --from=sing-box-build /usr/local/bin/sing-box /usr/local/bin/sing-box
+COPY --from=geocheck /usr/local/bin/geocheck /usr/local/bin/geocheck
 
 RUN printf '%s\n' '{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}' > /tmp/sing-box-smoke.json \
 	&& /usr/local/bin/sing-box check -c /tmp/sing-box-smoke.json \

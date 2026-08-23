@@ -24,6 +24,7 @@ import (
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	"github.com/remnawave/remnawave-node-go/internal/coreapi"
 	"github.com/remnawave/remnawave-node-go/internal/forwarding"
+	"github.com/remnawave/remnawave-node-go/internal/geocheck"
 	"github.com/remnawave/remnawave-node-go/internal/state"
 	"github.com/remnawave/remnawave-node-go/internal/statname"
 	"github.com/remnawave/remnawave-node-go/internal/supervisor"
@@ -78,6 +79,7 @@ type Manager struct {
 	xrayRoute          coreapi.RoutingClient
 	usageSnapshots     *usagesnapshot.Store
 	forwarding         *forwarding.Service
+	geocheck           *geocheck.Runner
 	usageMu            sync.Mutex
 	usageCoreRestarted bool
 	runCommand         commandRunner
@@ -280,6 +282,7 @@ func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Log
 		xrayRoute:          xrayRouting,
 		usageSnapshots:     usageSnapshots,
 		forwarding:         forwarding.New(cfg.ForwardingStatePath, cfg.NodePort, logger),
+		geocheck:           geocheck.New(geocheck.DefaultBinaryPath),
 		runCommand:         runCombinedOutput,
 		healthTimeout:      defaultSingBoxHealthTimeout,
 		healthPollInterval: defaultSingBoxHealthPollInterval,
@@ -288,6 +291,10 @@ func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Log
 		logger.Error("failed to restore forwarding rules", "error", err)
 	}
 	return manager, nil
+}
+
+func (m *Manager) Geocheck(ctx context.Context, request geocheck.Request) (map[string]any, error) {
+	return m.geocheck.Run(ctx, request)
 }
 
 func (m *Manager) Close() error {
@@ -492,6 +499,19 @@ func (m *Manager) RefreshForwardingDNS(ctx context.Context) {
 	defer cancel()
 	if err := m.forwarding.RefreshDNS(refreshCtx, m.currentCoreListeners()); err != nil {
 		m.logger.Warn("failed to refresh forwarding DNS targets", "error", err)
+	}
+	previousPluginState := m.state.PluginState()
+	pluginState := previousPluginState
+	previous := append([]string(nil), pluginState.EgressBlockedIPs...)
+	if err := resolveEgressDomains(refreshCtx, &pluginState); err != nil {
+		m.logger.Warn("failed to refresh plugin egress DNS targets", "error", err)
+	} else if !reflect.DeepEqual(previous, pluginState.EgressBlockedIPs) {
+		if err := m.syncNFTState(refreshCtx, pluginState); err != nil {
+			m.logger.Warn("failed to apply refreshed plugin egress DNS targets", "error", err)
+			m.restorePluginNFTState(previousPluginState)
+		} else {
+			m.state.SetPluginState(pluginState)
+		}
 	}
 }
 
@@ -1119,24 +1139,34 @@ func (m *Manager) SyncPlugin(ctx context.Context, request PluginSyncRequest) map
 	next.ConfigHash = state.ConfigHash(request.Plugin.Config)
 	next.ActivePlugin = &state.PluginMeta{UUID: request.Plugin.UUID, Name: request.Plugin.Name}
 	sharedLists := readSharedLists(request.Plugin.Config)
+	if err := validateSharedListReferences(request.Plugin.Config, sharedLists); err != nil {
+		return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
+	}
 	configureConnectionDrop(&next, request.Plugin.Config, sharedLists)
 	configureTorrentBlocker(&next, request.Plugin.Config, sharedLists)
 	configureIngressFilter(&next, request.Plugin.Config, sharedLists)
 	configureEgressFilter(&next, request.Plugin.Config, sharedLists)
+	if err := resolveEgressDomains(ctx, &next); err != nil {
+		return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
+	}
 
 	changedTorrent := current.TorrentEnabled != next.TorrentEnabled || current.TorrentDuration != next.TorrentDuration || !sameStringSet(current.TorrentIncludeRuleTags, next.TorrentIncludeRuleTags)
 	if m.nftReady {
-		if err := m.recreateNFTables(ctx); err != nil {
-			return map[string]any{"response": map[string]any{"accepted": false}}
-		}
-		if err := m.syncNFTState(ctx, next); err != nil {
-			return map[string]any{"response": map[string]any{"accepted": false}}
+		if err := m.applyPluginNFTState(ctx, next, current); err != nil {
+			return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
 		}
 	}
 	m.state.SetPluginState(next)
 	if changedTorrent {
 		if err := m.restartCurrentCore(ctx); err != nil {
-			return map[string]any{"response": map[string]any{"accepted": false}}
+			m.state.SetPluginState(current)
+			m.restorePluginNFTState(current)
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if rollbackErr := m.restartCurrentCore(rollbackCtx); rollbackErr != nil {
+				m.logger.Error("failed to restart core after plugin rollback", "error", rollbackErr)
+			}
+			return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
 		}
 	}
 	return map[string]any{"response": map[string]any{"accepted": true}}
@@ -1895,10 +1925,10 @@ func (m *Manager) recreateNFTables(ctx context.Context) error {
 	for _, cmd := range [][]string{
 		{"add", "set", "inet", nftTableName, "torrent-blocker", "{", "type", "ipv4_addr;", "flags", "timeout;", "}"},
 		{"add", "set", "inet", nftTableName, "torrent-blocker6", "{", "type", "ipv6_addr;", "flags", "timeout;", "}"},
-		{"add", "set", "inet", nftTableName, "ingress-filter-ip", "{", "type", "ipv4_addr;", "}"},
-		{"add", "set", "inet", nftTableName, "ingress-filter-ip6", "{", "type", "ipv6_addr;", "}"},
-		{"add", "set", "inet", nftTableName, "egress-filter-ip", "{", "type", "ipv4_addr;", "}"},
-		{"add", "set", "inet", nftTableName, "egress-filter-ip6", "{", "type", "ipv6_addr;", "}"},
+		{"add", "set", "inet", nftTableName, "ingress-filter-ip", "{", "type", "ipv4_addr;", "flags", "interval;", "auto-merge;", "}"},
+		{"add", "set", "inet", nftTableName, "ingress-filter-ip6", "{", "type", "ipv6_addr;", "flags", "interval;", "auto-merge;", "}"},
+		{"add", "set", "inet", nftTableName, "egress-filter-ip", "{", "type", "ipv4_addr;", "flags", "interval;", "auto-merge;", "}"},
+		{"add", "set", "inet", nftTableName, "egress-filter-ip6", "{", "type", "ipv6_addr;", "flags", "interval;", "auto-merge;", "}"},
 		{"add", "set", "inet", nftTableName, "egress-filter-port", "{", "type", "inet_service;", "}"},
 		{"add", "chain", "inet", nftTableName, "input", "{", "type", "filter", "hook", "input", "priority", "0;", "policy", "accept;", "}"},
 		{"add", "chain", "inet", nftTableName, "output", "{", "type", "filter", "hook", "output", "priority", "0;", "policy", "accept;", "}"},
@@ -1940,6 +1970,33 @@ func (m *Manager) syncNFTState(ctx context.Context, pluginState state.PluginStat
 	return nil
 }
 
+func (m *Manager) applyPluginNFTState(ctx context.Context, next, fallback state.PluginState) error {
+	if err := m.recreateNFTables(ctx); err != nil {
+		m.restorePluginNFTState(fallback)
+		return err
+	}
+	if err := m.syncNFTState(ctx, next); err != nil {
+		m.restorePluginNFTState(fallback)
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) restorePluginNFTState(pluginState state.PluginState) {
+	if !m.nftReady {
+		return
+	}
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := m.recreateNFTables(rollbackCtx); err != nil {
+		m.logger.Error("failed to recreate nftables during plugin rollback", "error", err)
+		return
+	}
+	if err := m.syncNFTState(rollbackCtx, pluginState); err != nil {
+		m.logger.Error("failed to restore last-good plugin nftables rules", "error", err)
+	}
+}
+
 func (m *Manager) blockIPWithTimeout(ctx context.Context, ip string, timeout int) error {
 	family, valid := nftSetFamily(ip)
 	if !valid {
@@ -1970,17 +2027,30 @@ func (m *Manager) nftSyncSet(ctx context.Context, setName string, items []string
 	}
 	filtered := make([]string, 0, len(items))
 	for _, item := range items {
-		parsed := net.ParseIP(item)
-		if parsed == nil || (parsed.To4() == nil) != ipv6 {
+		value, itemIPv6, valid := normalizeIPOrCIDR(item)
+		if !valid || itemIPv6 != ipv6 {
 			continue
 		}
-		filtered = append(filtered, item)
+		filtered = append(filtered, value)
 	}
 	if len(filtered) == 0 {
 		return nil
 	}
 	args := []string{"add", "element", "inet", nftTableName, setName, "{", strings.Join(filtered, ", "), "}"}
 	return m.runNft(ctx, args...)
+}
+
+func normalizeIPOrCIDR(value string) (string, bool, bool) {
+	value = strings.TrimSpace(value)
+	if ip := net.ParseIP(value); ip != nil {
+		return ip.String(), ip.To4() == nil, true
+	}
+	ip, network, err := net.ParseCIDR(value)
+	if err != nil {
+		return "", false, false
+	}
+	network.IP = ip.Mask(network.Mask)
+	return network.String(), ip.To4() == nil, true
 }
 
 func nftSetFamily(ip string) (string, bool) {
@@ -2372,25 +2442,71 @@ func removeSingBoxUser(config map[string]any, username string) {
 	}
 }
 
-func readSharedLists(config map[string]any) map[string][]string {
-	out := map[string][]string{}
+type pluginSharedList struct {
+	Type  string
+	Items []string
+}
+
+func readSharedLists(config map[string]any) map[string]pluginSharedList {
+	out := map[string]pluginSharedList{}
 	for _, list := range asMapSlice(config["sharedLists"]) {
 		name := stringValue(list["name"])
-		if name == "" {
+		listType := stringValue(list["type"])
+		if name == "" || listType == "" {
 			continue
 		}
 		items := make([]string, 0)
 		for _, item := range asAnySlice(list["items"]) {
-			if value, ok := item.(string); ok {
+			switch value := item.(type) {
+			case string:
 				items = append(items, value)
+			case float64:
+				if value == float64(int(value)) {
+					items = append(items, strconv.Itoa(int(value)))
+				}
 			}
 		}
-		out[name] = items
+		out[name] = pluginSharedList{Type: listType, Items: items}
 	}
 	return out
 }
 
-func configureConnectionDrop(target *state.PluginState, config map[string]any, shared map[string][]string) {
+func validateSharedListReferences(config map[string]any, shared map[string]pluginSharedList) error {
+	type referenceField struct {
+		values   []any
+		expected string
+	}
+	torrent := ensureConfigMap(config["torrentBlocker"])
+	connectionDrop := ensureConfigMap(config["connectionDrop"])
+	ingress := ensureConfigMap(config["ingressFilter"])
+	egress := ensureConfigMap(config["egressFilter"])
+	fields := []referenceField{
+		{values: asAnySlice(ensureConfigMap(torrent["ignoreLists"])["ip"]), expected: "ipList"},
+		{values: asAnySlice(connectionDrop["whitelistIps"]), expected: "ipList"},
+		{values: asAnySlice(ingress["blockedIps"]), expected: "ipList"},
+		{values: asAnySlice(egress["blockedIps"]), expected: "ipList"},
+		{values: asAnySlice(egress["blockedDomains"]), expected: "domainList"},
+		{values: asAnySlice(egress["blockedPorts"]), expected: "portList"},
+	}
+	for _, field := range fields {
+		for _, item := range field.values {
+			value, ok := item.(string)
+			if !ok || !strings.HasPrefix(value, "ext:") {
+				continue
+			}
+			list, exists := shared[value]
+			if !exists {
+				return fmt.Errorf("shared list %q was not provided", value)
+			}
+			if list.Type != field.expected {
+				return fmt.Errorf("shared list %q has type %q, expected %q", value, list.Type, field.expected)
+			}
+		}
+	}
+	return nil
+}
+
+func configureConnectionDrop(target *state.PluginState, config map[string]any, shared map[string]pluginSharedList) {
 	plugin := ensureConfigMap(config["connectionDrop"])
 	if !boolValue(plugin["enabled"]) {
 		return
@@ -2398,7 +2514,7 @@ func configureConnectionDrop(target *state.PluginState, config map[string]any, s
 	target.ConnectionDropWhitelist = sliceToSet(resolveIPList(stringSlice(plugin["whitelistIps"]), shared))
 }
 
-func configureTorrentBlocker(target *state.PluginState, config map[string]any, shared map[string][]string) {
+func configureTorrentBlocker(target *state.PluginState, config map[string]any, shared map[string]pluginSharedList) {
 	plugin := ensureConfigMap(config["torrentBlocker"])
 	if !boolValue(plugin["enabled"]) {
 		return
@@ -2411,7 +2527,7 @@ func configureTorrentBlocker(target *state.PluginState, config map[string]any, s
 	target.TorrentIncludeRuleTags = sliceToSet(stringSlice(plugin["includeRuleTags"]))
 }
 
-func configureIngressFilter(target *state.PluginState, config map[string]any, shared map[string][]string) {
+func configureIngressFilter(target *state.PluginState, config map[string]any, shared map[string]pluginSharedList) {
 	plugin := ensureConfigMap(config["ingressFilter"])
 	if !boolValue(plugin["enabled"]) {
 		return
@@ -2419,13 +2535,36 @@ func configureIngressFilter(target *state.PluginState, config map[string]any, sh
 	target.IngressBlocked = resolveIPList(stringSlice(plugin["blockedIps"]), shared)
 }
 
-func configureEgressFilter(target *state.PluginState, config map[string]any, shared map[string][]string) {
+func configureEgressFilter(target *state.PluginState, config map[string]any, shared map[string]pluginSharedList) {
 	plugin := ensureConfigMap(config["egressFilter"])
 	if !boolValue(plugin["enabled"]) {
 		return
 	}
-	target.EgressBlockedIPs = resolveIPList(stringSlice(plugin["blockedIps"]), shared)
-	target.EgressBlockedPorts = intSlice(plugin["blockedPorts"])
+	target.EgressBlockedBaseIPs = resolveIPList(stringSlice(plugin["blockedIps"]), shared)
+	target.EgressBlockedIPs = append([]string(nil), target.EgressBlockedBaseIPs...)
+	target.EgressBlockedDomains = resolveStringList(stringSlice(plugin["blockedDomains"]), shared)
+	target.EgressBlockedPorts = resolvePortList(asAnySlice(plugin["blockedPorts"]), shared)
+}
+
+func resolveEgressDomains(ctx context.Context, target *state.PluginState) error {
+	resolved := append([]string(nil), target.EgressBlockedBaseIPs...)
+	for _, domain := range target.EgressBlockedDomains {
+		if net.ParseIP(domain) != nil || strings.ContainsAny(domain, " /\\") {
+			return fmt.Errorf("invalid egress domain %q", domain)
+		}
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
+		if err != nil {
+			return fmt.Errorf("resolve egress domain %q: %w", domain, err)
+		}
+		if len(ips) == 0 {
+			return fmt.Errorf("egress domain %q resolved to no addresses", domain)
+		}
+		for _, ip := range ips {
+			resolved = append(resolved, ip.String())
+		}
+	}
+	target.EgressBlockedIPs = uniqueStrings(resolved)
+	return nil
 }
 
 func emptyPluginState() state.PluginState {
@@ -2437,15 +2576,69 @@ func emptyPluginState() state.PluginState {
 	}
 }
 
-func resolveIPList(values []string, shared map[string][]string) []string {
+func resolveIPList(values []string, shared map[string]pluginSharedList) []string {
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		if strings.HasPrefix(value, "ext:") {
-			out = append(out, shared[value]...)
+			out = append(out, shared[value].Items...)
 			continue
 		}
 		out = append(out, value)
 	}
+	return out
+}
+
+func resolveStringList(values []string, shared map[string]pluginSharedList) []string {
+	return uniqueStrings(resolveIPList(values, shared))
+}
+
+func resolvePortList(values []any, shared map[string]pluginSharedList) []int {
+	ports := make([]int, 0, len(values))
+	appendValue := func(value string) {
+		port, err := strconv.Atoi(value)
+		if err == nil && port >= 1 && port <= 65535 {
+			ports = append(ports, port)
+		}
+	}
+	for _, item := range values {
+		switch value := item.(type) {
+		case float64:
+			appendValue(strconv.Itoa(int(value)))
+		case string:
+			if strings.HasPrefix(value, "ext:") {
+				for _, sharedValue := range shared[value].Items {
+					appendValue(sharedValue)
+				}
+			} else {
+				appendValue(value)
+			}
+		}
+	}
+	sort.Ints(ports)
+	out := ports[:0]
+	for _, port := range ports {
+		if len(out) == 0 || out[len(out)-1] != port {
+			out = append(out, port)
+		}
+	}
+	return out
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Strings(out)
 	return out
 }
 

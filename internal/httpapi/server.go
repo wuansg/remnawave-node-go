@@ -22,6 +22,7 @@ import (
 	"github.com/remnawave/remnawave-node-go/internal/auth"
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	"github.com/remnawave/remnawave-node-go/internal/forwarding"
+	"github.com/remnawave/remnawave-node-go/internal/geocheck"
 	nodeapp "github.com/remnawave/remnawave-node-go/internal/node"
 	"github.com/remnawave/remnawave-node-go/internal/usagesnapshot"
 )
@@ -227,6 +228,22 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 			return
 		}
 		writeJSON(w, http.StatusOK, response)
+	}))
+	mux.HandleFunc("POST /node/stats/get-geocheck", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		var body geocheck.Request
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		report, err := s.manager.Geocheck(r.Context(), body)
+		if err != nil {
+			status := http.StatusUnprocessableEntity
+			if errors.Is(err, geocheck.ErrAlreadyRunning) {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, map[string]any{"message": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": report})
 	}))
 	mux.HandleFunc("POST /node/stats/get-users-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.GetUsersStatsRequest
