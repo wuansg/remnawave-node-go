@@ -63,6 +63,7 @@ type AckRequest struct {
 
 type Status struct {
 	Active         bool   `json:"active"`
+	Capturing      bool   `json:"capturing"`
 	Generation     string `json:"generation"`
 	OldestSequence uint64 `json:"oldestSequence"`
 	LatestSequence uint64 `json:"latestSequence"`

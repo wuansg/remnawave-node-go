@@ -538,7 +538,8 @@ func (m *Manager) ActivateUsageSnapshots(ctx context.Context) (usagesnapshot.Sta
 	if err != nil {
 		return usagesnapshot.Status{}, err
 	}
-	return m.usageSnapshots.Activate(counters)
+	status, err := m.usageSnapshots.Activate(counters)
+	return m.withUsageSnapshotRuntime(status), err
 }
 
 func (m *Manager) CaptureUsageSnapshot(ctx context.Context) {
@@ -581,14 +582,27 @@ func (m *Manager) AckUsageSnapshots(request usagesnapshot.AckRequest) (usagesnap
 	if m.usageSnapshots == nil {
 		return usagesnapshot.Status{}, errors.New("usage snapshot storage is unavailable")
 	}
-	return m.usageSnapshots.Ack(request)
+	status, err := m.usageSnapshots.Ack(request)
+	return m.withUsageSnapshotRuntime(status), err
 }
 
 func (m *Manager) UsageSnapshotStatus() (usagesnapshot.Status, error) {
 	if m.usageSnapshots == nil {
 		return usagesnapshot.Status{}, errors.New("usage snapshot storage is unavailable")
 	}
-	return m.usageSnapshots.Status()
+	status, err := m.usageSnapshots.Status()
+	return m.withUsageSnapshotRuntime(status), err
+}
+
+func (m *Manager) withUsageSnapshotRuntime(status usagesnapshot.Status) usagesnapshot.Status {
+	if !status.Active {
+		return status
+	}
+	runningCore := m.state.RunningCoreType()
+	xrayOnline, singBoxOnline := m.state.OnlineStatus()
+	status.Capturing = (runningCore == state.CoreTypeXRAY && xrayOnline) ||
+		(runningCore == state.CoreTypeSingBox && singBoxOnline)
+	return status
 }
 
 func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Counter, error) {

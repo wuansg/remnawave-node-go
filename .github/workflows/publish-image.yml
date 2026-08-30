@@ -13,7 +13,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  REMNAWAVE_NODE_VERSION: 3.5.0
+  REMNAWAVE_NODE_VERSION: 3.5.1
 
 jobs:
   test:
@@ -72,7 +72,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           build-args: |
             REMNAWAVE_NODE_VERSION=${{ env.REMNAWAVE_NODE_VERSION }}

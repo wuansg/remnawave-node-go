@@ -7,6 +7,7 @@ import (
 
 	"github.com/remnawave/remnawave-node-go/internal/state"
 	"github.com/remnawave/remnawave-node-go/internal/supervisor"
+	"github.com/remnawave/remnawave-node-go/internal/usagesnapshot"
 )
 
 func TestResolveRuntimeMode(t *testing.T) {
@@ -30,6 +31,23 @@ func TestResolveRuntimeMode(t *testing.T) {
 				t.Fatalf("resolveRuntimeMode() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestUsageSnapshotRuntimeStatusSeparatesEnabledFromCapturing(t *testing.T) {
+	runtimeState := state.New("3.5.1")
+	manager := &Manager{state: runtimeState}
+
+	status := manager.withUsageSnapshotRuntime(usagesnapshot.Status{Active: true})
+	if !status.Active || status.Capturing {
+		t.Fatalf("coreless status = %+v, want active without capturing", status)
+	}
+
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.SetOnlineStatus(false, true)
+	status = manager.withUsageSnapshotRuntime(usagesnapshot.Status{Active: true})
+	if !status.Active || !status.Capturing {
+		t.Fatalf("online sing-box status = %+v, want active and capturing", status)
 	}
 }
 

@@ -26,6 +26,8 @@ const (
 type usageSnapshotRuntimeStatus struct {
 	Supported bool `json:"supported"`
 	Active    bool `json:"active"`
+	Enabled   bool `json:"enabled"`
+	Capturing bool `json:"capturing"`
 }
 
 type agentRuntimeStatus struct {
@@ -56,6 +58,8 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 	usageStatus := usageSnapshotRuntimeStatus{Supported: m.usageSnapshots != nil}
 	if m.usageSnapshots != nil {
 		usageStatus.Active = m.usageSnapshots.Active()
+		usageStatus.Enabled = usageStatus.Active
+		usageStatus.Capturing = usageStatus.Active && coreOnline
 		capabilities = append(capabilities, usagesnapshot.Capability)
 	}
 
