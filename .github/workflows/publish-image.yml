@@ -13,7 +13,8 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  REMNAWAVE_NODE_VERSION: 3.5.1
+  REMNAWAVE_NODE_VERSION: 3.6.0
+  SING_BOX_VERSION: 1.14.0
 
 jobs:
   test:
@@ -76,5 +77,6 @@ jobs:
           push: true
           build-args: |
             REMNAWAVE_NODE_VERSION=${{ env.REMNAWAVE_NODE_VERSION }}
+            SING_BOX_VERSION=${{ env.SING_BOX_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

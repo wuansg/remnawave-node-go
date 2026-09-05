@@ -1,6 +1,6 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
-ARG REMNAWAVE_NODE_VERSION=3.5.1
+ARG REMNAWAVE_NODE_VERSION=3.6.0
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -39,7 +39,7 @@ RUN apk add --no-cache curl unzip \
 
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS sing-box-build
 
-ARG SING_BOX_VERSION=1.13.16
+ARG SING_BOX_VERSION=1.14.0
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -74,7 +74,8 @@ RUN apk add --no-cache curl \
 
 FROM alpine:3.22
 
-ARG SING_BOX_VERSION=1.13.16
+ARG REMNAWAVE_NODE_VERSION=3.6.0
+ARG SING_BOX_VERSION=1.14.0
 
 LABEL org.opencontainers.image.title="Remnawave Node Go"
 LABEL org.opencontainers.image.description="Go-based Remnawave Node with Xray and Sing-box support"
@@ -83,6 +84,8 @@ LABEL org.opencontainers.image.source="https://github.com/remnawave/remnawave-no
 LABEL org.opencontainers.image.vendor="Remnawave"
 LABEL org.opencontainers.image.licenses="AGPL-3.0"
 LABEL org.opencontainers.image.documentation="https://docs.rw"
+LABEL org.opencontainers.image.version="${REMNAWAVE_NODE_VERSION}"
+LABEL org.opencontainers.image.sing-box.version="${SING_BOX_VERSION}"
 
 RUN apk add --no-cache supervisor curl ca-certificates iproute2 nftables \
 	&& mkdir -p /var/log/supervisor /run/remnawave /var/lib/remnanode
@@ -95,7 +98,9 @@ COPY --from=sing-box-build /usr/local/bin/sing-box /usr/local/bin/sing-box
 COPY --from=geocheck /usr/local/bin/geocheck /usr/local/bin/geocheck
 
 RUN printf '%s\n' '{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}' > /tmp/sing-box-smoke.json \
+	&& /usr/local/bin/sing-box version | grep -F "sing-box version ${SING_BOX_VERSION}" \
 	&& /usr/local/bin/sing-box check -c /tmp/sing-box-smoke.json \
+	&& /usr/local/bin/sing-box schema > /dev/null \
 	&& rm /tmp/sing-box-smoke.json
 
 COPY supervisord.conf /etc/supervisord.conf
