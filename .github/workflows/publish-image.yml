@@ -63,10 +63,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=main,enable={{is_default_branch}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ env.REMNAWAVE_NODE_VERSION }}
-            type=sha,format=short
+            type=raw,value=${{ env.REMNAWAVE_NODE_VERSION }},priority=1000
+            type=raw,value=main,enable={{is_default_branch}},priority=200
+            type=raw,value=latest,enable={{is_default_branch}},priority=100
+            type=sha,format=short,priority=50
 
       - name: Build and push
         uses: docker/build-push-action@v6
