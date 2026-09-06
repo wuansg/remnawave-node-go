@@ -79,7 +79,6 @@ jobs:
             REMNAWAVE_NODE_VERSION=${{ env.REMNAWAVE_NODE_VERSION }}
             SING_BOX_VERSION=${{ env.SING_BOX_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
 
       - name: Publish combined version tag
         run: |
