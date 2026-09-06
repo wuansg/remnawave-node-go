@@ -47,7 +47,7 @@ RUN apk add --no-cache curl \
     && install -m 0755 geocheck /usr/local/bin/geocheck
 
 
-FROM alpine:3.22
+FROM --platform=$TARGETPLATFORM alpine:3.22
 
 ARG REMNAWAVE_NODE_VERSION=3.7.0
 ARG SING_BOX_VERSION=1.14.0

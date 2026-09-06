@@ -44,6 +44,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -60,20 +65,25 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ env.REMNAWAVE_NODE_VERSION }},priority=1000
-            type=raw,value=main,enable={{is_default_branch}},priority=200
-            type=raw,value=latest,enable={{is_default_branch}},priority=100
-            type=sha,format=short,priority=50
+            type=raw,value=${{ env.REMNAWAVE_NODE_VERSION }}-arm64,priority=1000
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          platforms: linux/arm64
           push: true
           build-args: |
             REMNAWAVE_NODE_VERSION=${{ env.REMNAWAVE_NODE_VERSION }}
             SING_BOX_VERSION=${{ env.SING_BOX_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Publish combined version tag
+        run: |
+          docker buildx imagetools create \
+            --tag "${REGISTRY}/${IMAGE_NAME}:${REMNAWAVE_NODE_VERSION}" \
+            "${REGISTRY}/${IMAGE_NAME}@sha256:a01833a0f6f6f95d893abfe844707244b48eecc4a4f99d85925f47c76986aa65" \
+            "${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
