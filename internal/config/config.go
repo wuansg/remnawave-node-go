@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const defaultVersion = "3.6.0"
+const defaultVersion = "3.7.0"
 
 var buildVersion = defaultVersion
 
@@ -21,12 +21,10 @@ type Config struct {
 	NodePort              int
 	SecretKey             string
 	DisableHashCheck      bool
-	XtlsAPIPort           int
 	SingBoxAPIPort        int
 	SingBoxV2RayAPIPort   int
 	InternalRESTToken     string
 	InternalSocketPath    string
-	XrayConfigPath        string
 	SupervisordSocket     string
 	SupervisordPIDPath    string
 	SupervisordUser       string
@@ -64,12 +62,10 @@ func Load() (Config, error) {
 		NodePort:              envInt("NODE_PORT", 2222),
 		SecretKey:             secret,
 		DisableHashCheck:      envBool("DISABLE_HASHED_SET_CHECK", false),
-		XtlsAPIPort:           envInt("XTLS_API_PORT", 61000),
 		SingBoxAPIPort:        envInt("SING_BOX_API_PORT", 61001),
 		SingBoxV2RayAPIPort:   envInt("SING_BOX_V2RAY_API_PORT", 61002),
 		InternalRESTToken:     os.Getenv("INTERNAL_REST_TOKEN"),
 		InternalSocketPath:    envString("INTERNAL_SOCKET_PATH", "/run/remnawave/internal.sock"),
-		XrayConfigPath:        envString("XRAY_CONFIG_PATH", "/run/remnawave/xray.json"),
 		SupervisordSocket:     os.Getenv("SUPERVISORD_SOCKET_PATH"),
 		SupervisordPIDPath:    os.Getenv("SUPERVISORD_PID_PATH"),
 		SupervisordUser:       os.Getenv("SUPERVISORD_USER"),

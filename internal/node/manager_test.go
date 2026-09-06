@@ -55,7 +55,6 @@ type fakeProcessSupervisor struct {
 
 func newFakeProcessSupervisor() *fakeProcessSupervisor {
 	return &fakeProcessSupervisor{states: map[string]int{
-		xrayProcessName:    supervisor.StateStopped,
 		singBoxProcessName: supervisor.StateStopped,
 	}}
 }
@@ -103,7 +102,7 @@ func TestRestartSingBoxRejectsInvalidCandidateWithoutStoppingCurrentCore(t *test
 	runtimeState := state.New("test")
 	runtimeState.SetSingBoxConfig(oldConfig)
 	runtimeState.SetRunningCore(state.CoreTypeSingBox)
-	runtimeState.SetOnlineStatus(false, true)
+	runtimeState.SetOnlineStatus(true)
 	// Dynamic user updates mutate runtime state before restarting the core. The
 	// rollback path must recover the actual running configuration from disk.
 	runtimeState.SetSingBoxConfig(map[string]any{"inbounds": []any{map[string]any{"tag": "new", "type": "anytls"}}})
@@ -160,7 +159,7 @@ func TestRestartSingBoxCommitsCandidateAndLastKnownGood(t *testing.T) {
 	runtimeState := state.New("test")
 	runtimeState.SetSingBoxConfig(map[string]any{"inbounds": []any{}})
 	runtimeState.SetRunningCore(state.CoreTypeSingBox)
-	runtimeState.SetOnlineStatus(false, true)
+	runtimeState.SetOnlineStatus(true)
 	fakeSupervisor := newFakeProcessSupervisor()
 	fakeSupervisor.states[singBoxProcessName] = supervisor.StateRunning
 	manager := &Manager{
@@ -216,7 +215,7 @@ func TestRestartSingBoxRollsBackAfterHealthFailure(t *testing.T) {
 	runtimeState := state.New("test")
 	runtimeState.SetSingBoxConfig(oldConfig)
 	runtimeState.SetRunningCore(state.CoreTypeSingBox)
-	runtimeState.SetOnlineStatus(false, true)
+	runtimeState.SetOnlineStatus(true)
 	runtimeState.SetSingBoxConfig(map[string]any{"inbounds": []any{map[string]any{"tag": "new", "type": "anytls"}}})
 	fakeSupervisor := newFakeProcessSupervisor()
 	fakeSupervisor.states[singBoxProcessName] = supervisor.StateRunning
@@ -271,26 +270,23 @@ func TestShouldRestartCoreIncludesCoreStatusAndConfiguration(t *testing.T) {
 		Inbounds:    []state.InboundHash{{Tag: "in", Hash: "users", UsersCount: 1}},
 	}
 	runtimeState := state.New("test")
-	runtimeState.SetRunningCore(state.CoreTypeXRAY)
-	runtimeState.SetOnlineStatus(true, false)
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.SetOnlineStatus(true)
 	runtimeState.SetLastHashes(hashes)
 
 	manager := &Manager{state: runtimeState}
-	if manager.shouldRestartCore(state.CoreTypeXRAY, false, hashes) {
+	if manager.shouldRestartCore(state.CoreTypeSingBox, false, hashes) {
 		t.Fatal("unchanged online core should not restart")
 	}
-	if !manager.shouldRestartCore(state.CoreTypeSingBox, false, hashes) {
-		t.Fatal("switching core must restart even when hashes match")
-	}
 
-	runtimeState.SetOnlineStatus(false, false)
-	if !manager.shouldRestartCore(state.CoreTypeXRAY, false, hashes) {
+	runtimeState.SetOnlineStatus(false)
+	if !manager.shouldRestartCore(state.CoreTypeSingBox, false, hashes) {
 		t.Fatal("offline core must restart even when hashes match")
 	}
 
-	runtimeState.SetOnlineStatus(true, false)
+	runtimeState.SetOnlineStatus(true)
 	manager.cfg = config.Config{DisableHashCheck: true}
-	if !manager.shouldRestartCore(state.CoreTypeXRAY, false, hashes) {
+	if !manager.shouldRestartCore(state.CoreTypeSingBox, false, hashes) {
 		t.Fatal("disabled hash checks must force a restart")
 	}
 }
@@ -308,7 +304,7 @@ func TestCaptureUsageSnapshotSkipsCorelessRuntime(t *testing.T) {
 	client := &fakeStatsClient{}
 	manager := &Manager{
 		state:          state.New("test"),
-		xrayStats:      client,
+		singStats:      client,
 		usageSnapshots: store,
 	}
 	manager.CaptureUsageSnapshot(context.Background())
@@ -326,12 +322,6 @@ func TestFormatCoreVersion(t *testing.T) {
 		line   string
 		want   string
 	}{
-		{
-			name:   "xray long version",
-			binary: "/usr/local/bin/xray",
-			line:   "Xray 26.3.27 (Xray, Penetrates Everything.) d2758a0 (go1.26.1 linux/amd64)",
-			want:   "26.3.27",
-		},
 		{
 			name:   "sing-box explicit version",
 			binary: "/usr/local/bin/sing-box",
@@ -362,7 +352,9 @@ func TestGetUsersStatsUsesCoreStatsAndReset(t *testing.T) {
 		{Name: "user>>>" + encodedUser + ">>>traffic>>>downlink", Value: 20},
 		{Name: "user>>>idle>>>traffic>>>uplink", Value: 0},
 	}}
-	manager := &Manager{state: state.New("test"), xrayStats: client}
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	manager := &Manager{state: runtimeState, singStats: client}
 	response := manager.GetUsersStats(context.Background(), GetUsersStatsRequest{Reset: true})
 	users := response["response"].(map[string]any)["users"].([]map[string]any)
 	if len(users) != 1 || users[0]["username"] != "user-a" || users[0]["uplink"] != int64(10) || users[0]["downlink"] != int64(20) {
@@ -379,7 +371,9 @@ func TestGetUsersInboundStatsReturnsInboundDimension(t *testing.T) {
 		{Name: "user>>>" + statname.UserInbound("user-a", "in-b") + ">>>traffic>>>downlink", Value: 20},
 		{Name: "user>>>legacy-user>>>traffic>>>uplink", Value: 30},
 	}}
-	manager := &Manager{state: state.New("test"), xrayStats: client}
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	manager := &Manager{state: runtimeState, singStats: client}
 	response := manager.GetUsersInboundStats(context.Background(), GetUsersInboundStatsRequest{Reset: true})
 	users := response["response"].(map[string]any)["users"].([]map[string]any)
 	if len(users) != 3 {
@@ -401,7 +395,9 @@ func TestGetInboundStatsAggregatesDirections(t *testing.T) {
 		{Name: "inbound>>>edge>>>traffic>>>uplink", Value: 11},
 		{Name: "inbound>>>edge>>>traffic>>>downlink", Value: 22},
 	}}
-	manager := &Manager{state: state.New("test"), xrayStats: client}
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	manager := &Manager{state: runtimeState, singStats: client}
 	response := manager.GetInboundStats(context.Background(), GetTagStatsRequest{Tag: "edge"})
 	item := response["response"].(map[string]any)
 	if item["uplink"] != int64(11) || item["downlink"] != int64(22) {
@@ -423,12 +419,12 @@ func TestGetSystemStatsRejectsOfflineCore(t *testing.T) {
 func TestGetSystemStatsIncludesRunningCoreInfo(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	runtimeState := state.New("test")
-	runtimeState.SetRunningCore(state.CoreTypeXRAY)
-	runtimeState.SetOnlineStatus(true, false)
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.SetOnlineStatus(true)
 	manager := &Manager{
 		state:     runtimeState,
 		network:   system.NewNetworkMonitor(logger),
-		xrayStats: &fakeStatsClient{},
+		singStats: &fakeStatsClient{},
 	}
 	response, err := manager.GetSystemStats(context.Background())
 	if err != nil {
@@ -447,19 +443,13 @@ func TestGetSystemStatsIncludesRunningCoreInfo(t *testing.T) {
 func TestGetSystemStatsRejectsUnavailableCoreAPI(t *testing.T) {
 	runtimeState := state.New("test")
 	runtimeState.SetRunningCore(state.CoreTypeSingBox)
-	runtimeState.SetOnlineStatus(false, true)
+	runtimeState.SetOnlineStatus(true)
 	manager := &Manager{
 		state:     runtimeState,
 		singStats: &fakeStatsClient{systemErr: errors.New("connection refused")},
 	}
 	if _, err := manager.GetSystemStats(context.Background()); !errors.Is(err, ErrCoreUnavailable) {
 		t.Fatalf("GetSystemStats() error = %v, want ErrCoreUnavailable", err)
-	}
-}
-
-func TestVisionRuleTagMatchesNodeObjectHash(t *testing.T) {
-	if got, want := visionRuleTag("1.2.3.4"), "0af2996736a0258868c61eb7f5151216"; got != want {
-		t.Fatalf("vision rule tag = %q, want %q", got, want)
 	}
 }
 
@@ -515,11 +505,11 @@ func TestAddSingBoxUserSupportsAnyTLSHy2AndTUIC(t *testing.T) {
 
 func TestApplyAddUserRequestKeepsAllRequestedInbounds(t *testing.T) {
 	runtimeState := state.New("test")
-	runtimeState.SetXrayConfig(map[string]any{"inbounds": []any{
-		map[string]any{"tag": "in-a", "protocol": "vless", "settings": map[string]any{"clients": []any{}}},
-		map[string]any{"tag": "in-b", "protocol": "vless", "settings": map[string]any{"clients": []any{}}},
+	runtimeState.SetSingBoxConfig(map[string]any{"inbounds": []any{
+		map[string]any{"tag": "in-a", "type": "vless", "users": []any{}},
+		map[string]any{"tag": "in-b", "type": "vless", "users": []any{}},
 	}})
-	runtimeState.SetRunningCore(state.CoreTypeXRAY)
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
 	manager := &Manager{state: runtimeState}
 	request := AddUserRequest{Data: []AddUserItem{
 		{Type: "vless", Tag: "in-a", Username: "user-a", UUID: "uuid-a"},
@@ -534,12 +524,11 @@ func TestApplyAddUserRequestKeepsAllRequestedInbounds(t *testing.T) {
 	if got := len(runtimeState.InboundUsers("in-b")); got != 1 {
 		t.Fatalf("in-b users = %d, want 1", got)
 	}
-	xrayConfig := runtimeState.XrayConfig()
-	inbounds := asMapSlice(xrayConfig["inbounds"])
-	firstSettings := inbounds[0]["settings"].(map[string]any)
-	firstClients := asMapSlice(firstSettings["clients"])
-	if got, want := stringValue(firstClients[0]["email"]), statname.UserInbound("user-a", "in-a"); got != want {
-		t.Fatalf("encoded xray stats username = %q, want %q", got, want)
+	singBoxConfig := runtimeState.SingBoxConfig()
+	inbounds := asMapSlice(singBoxConfig["inbounds"])
+	firstUsers := asMapSlice(inbounds[0]["users"])
+	if got, want := stringValue(firstUsers[0]["name"]), statname.UserInbound("user-a", "in-a"); got != want {
+		t.Fatalf("encoded sing-box stats username = %q, want %q", got, want)
 	}
 	if got := runtimeState.InboundUsers("in-a")[0].UserID; got != "user-a" {
 		t.Fatalf("runtime inbound user should expose real user id, got %q", got)
@@ -581,39 +570,6 @@ func TestApplySingBoxAPIConfigEncodesUsersForStats(t *testing.T) {
 	}
 }
 
-func TestApplyXrayAPIConfigEncodesUsersForStats(t *testing.T) {
-	rawConfig := map[string]any{
-		"inbounds": []any{
-			map[string]any{
-				"tag":      "in-a",
-				"protocol": "vless",
-				"settings": map[string]any{
-					"clients": []any{
-						map[string]any{"email": "2", "id": "uuid-a"},
-					},
-				},
-			},
-		},
-	}
-
-	encoded := applyXrayAPIConfig(rawConfig, config.Config{XtlsAPIPort: 61000}, state.PluginState{}, nil)
-	var targetInbound map[string]any
-	for _, inbound := range asMapSlice(encoded["inbounds"]) {
-		if stringValue(inbound["tag"]) == "in-a" {
-			targetInbound = inbound
-			break
-		}
-	}
-	if targetInbound == nil {
-		t.Fatal("in-a inbound not found")
-	}
-	settings := targetInbound["settings"].(map[string]any)
-	clients := asMapSlice(settings["clients"])
-	if got, want := stringValue(clients[0]["email"]), statname.UserInbound("2", "in-a"); got != want {
-		t.Fatalf("xray client email = %q, want %q", got, want)
-	}
-}
-
 func TestSingBoxUserConnectionStatsReturnEmpty(t *testing.T) {
 	runtimeState := state.New("test")
 	runtimeState.SetRunningCore(state.CoreTypeSingBox)
@@ -634,23 +590,5 @@ func TestSingBoxUserConnectionStatsReturnEmpty(t *testing.T) {
 	online := manager.GetUserOnlineStatus(context.Background(), GetUserOnlineStatusRequest{Username: "2"})
 	if online["response"].(map[string]any)["isOnline"].(bool) {
 		t.Fatalf("expected sing-box user online status to be false")
-	}
-}
-
-func TestXrayUserConnectionStatsUseRecordedIPs(t *testing.T) {
-	runtimeState := state.New("test")
-	runtimeState.SetRunningCore(state.CoreTypeXRAY)
-	runtimeState.RecordUserIP("2", "163.125.176.65", time.Unix(1710000000, 0))
-
-	manager := &Manager{state: runtimeState}
-
-	userIPs := manager.GetUserIPList(context.Background(), GetUserIPListRequest{UserID: "2"})
-	if got := len(userIPs["response"].(map[string]any)["ips"].([]map[string]any)); got != 1 {
-		t.Fatalf("expected xray user ip list to contain 1 item, got %d", got)
-	}
-
-	usersIPs := manager.GetUsersIPList(context.Background())
-	if got := len(usersIPs["response"].(map[string]any)["users"].([]map[string]any)); got != 1 {
-		t.Fatalf("expected xray users ip list to contain 1 user, got %d", got)
 	}
 }

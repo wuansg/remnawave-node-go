@@ -2,9 +2,7 @@ package node
 
 import (
 	"context"
-	"crypto/md5"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -34,12 +32,8 @@ import (
 )
 
 const (
-	xrayProcessName    = "xray"
 	singBoxProcessName = "sing-box"
 	nftTableName       = "remnanode"
-	xrayAPITag         = "REMNAWAVE_API"
-	xrayAPIInboundTag  = "REMNAWAVE_API_INBOUND"
-	torrentOutboundTag = "RW_TB_OUTBOUND_BLOCK"
 )
 
 var (
@@ -72,11 +66,7 @@ type Manager struct {
 	nftReady           bool
 	startedAt          time.Time
 	coreMu             sync.Mutex
-	apiTLS             *coreapi.MTLSBundle
-	xrayStats          coreapi.StatsClient
 	singStats          coreapi.StatsClient
-	xrayHandle         coreapi.HandlerClient
-	xrayRoute          coreapi.RoutingClient
 	usageSnapshots     *usagesnapshot.Store
 	forwarding         *forwarding.Service
 	geocheck           *geocheck.Runner
@@ -104,7 +94,6 @@ const (
 type StartRequest struct {
 	CoreType      string         `json:"coreType"`
 	Internals     startInternals `json:"internals"`
-	XrayConfig    map[string]any `json:"xrayConfig"`
 	SingBoxConfig map[string]any `json:"singBoxConfig"`
 }
 
@@ -229,42 +218,13 @@ type UnblockIPsRequest struct {
 }
 
 func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Logger, client *supervisor.Client, network *system.NetworkMonitor) (*Manager, error) {
-	bundle, err := coreapi.GenerateMTLSBundle()
-	if err != nil {
-		return nil, fmt.Errorf("generate internal API certificates: %w", err)
-	}
-	credentials, err := bundle.ClientCredentials()
-	if err != nil {
-		return nil, err
-	}
-	xrayStats, err := coreapi.NewXrayStatsClient(fmt.Sprintf("127.0.0.1:%d", cfg.XtlsAPIPort), credentials)
-	if err != nil {
-		return nil, err
-	}
 	singStats, err := coreapi.NewSingBoxStatsClient(fmt.Sprintf("127.0.0.1:%d", singBoxV2RayAPIPort(cfg)), insecure.NewCredentials())
 	if err != nil {
-		_ = xrayStats.Close()
-		return nil, err
-	}
-	xrayHandler, err := coreapi.NewXrayHandlerClient(fmt.Sprintf("127.0.0.1:%d", cfg.XtlsAPIPort), credentials)
-	if err != nil {
-		_ = xrayStats.Close()
-		_ = singStats.Close()
-		return nil, err
-	}
-	xrayRouting, err := coreapi.NewXrayRoutingClient(fmt.Sprintf("127.0.0.1:%d", cfg.XtlsAPIPort), credentials)
-	if err != nil {
-		_ = xrayStats.Close()
-		_ = singStats.Close()
-		_ = xrayHandler.Close()
 		return nil, err
 	}
 	usageSnapshots, err := usagesnapshot.Open(cfg.UsageSnapshotDBPath, cfg.UsageSnapshotMaxBytes)
 	if err != nil {
-		_ = xrayStats.Close()
 		_ = singStats.Close()
-		_ = xrayHandler.Close()
-		_ = xrayRouting.Close()
 		return nil, err
 	}
 	manager := &Manager{
@@ -275,11 +235,7 @@ func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Log
 		network:            network,
 		nftReady:           commandExists("nft") && hasNetAdmin(),
 		startedAt:          time.Now(),
-		apiTLS:             bundle,
-		xrayStats:          xrayStats,
 		singStats:          singStats,
-		xrayHandle:         xrayHandler,
-		xrayRoute:          xrayRouting,
 		usageSnapshots:     usageSnapshots,
 		forwarding:         forwarding.New(cfg.ForwardingStatePath, cfg.NodePort, logger),
 		geocheck:           geocheck.New(geocheck.DefaultBinaryPath),
@@ -299,21 +255,8 @@ func (m *Manager) Geocheck(ctx context.Context, request geocheck.Request) (map[s
 
 func (m *Manager) Close() error {
 	var first error
-	if m.xrayStats != nil {
-		first = m.xrayStats.Close()
-	}
 	if m.singStats != nil {
 		if err := m.singStats.Close(); first == nil {
-			first = err
-		}
-	}
-	if m.xrayHandle != nil {
-		if err := m.xrayHandle.Close(); first == nil {
-			first = err
-		}
-	}
-	if m.xrayRoute != nil {
-		if err := m.xrayRoute.Close(); first == nil {
 			first = err
 		}
 	}
@@ -326,9 +269,8 @@ func (m *Manager) Close() error {
 }
 
 func (m *Manager) SyncEnvironment(ctx context.Context) {
-	xrayVersion := m.readVersion(ctx, "/usr/local/bin/xray", "-version")
 	singBoxVersion := m.readVersion(ctx, "/usr/local/bin/sing-box", "version")
-	m.state.SetCoreVersions(xrayVersion, singBoxVersion)
+	m.state.SetCoreVersion(singBoxVersion)
 	m.refreshOnlineStatus(ctx)
 }
 
@@ -340,7 +282,7 @@ func (m *Manager) SyncProcessStatus(ctx context.Context) {
 }
 
 func (m *Manager) InternalConfig() map[string]any {
-	return m.state.XrayConfig()
+	return m.state.SingBoxConfig()
 }
 
 func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP string) map[string]any {
@@ -349,56 +291,31 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 
 	m.SyncEnvironment(ctx)
 
-	coreType := state.CoreTypeXRAY
-	if strings.EqualFold(request.CoreType, string(state.CoreTypeSingBox)) || strings.EqualFold(request.CoreType, "SING_BOX") {
-		coreType = state.CoreTypeSingBox
-	}
+	coreType := state.CoreTypeSingBox
 
 	snapshot := system.SystemSnapshot(m.network)
 	shouldRestart := m.shouldRestartCore(coreType, request.Internals.ForceRestart, request.Internals.Hashes)
 
-	switch coreType {
-	case state.CoreTypeSingBox:
-		config := applySingBoxAPIConfig(normalizeSingBoxKeys(cloneMap(request.SingBoxConfig)), m.cfg)
-		if len(config) == 0 {
-			return wrapStartResponse(false, nil, ptrString("singBoxConfig is required for SING_BOX core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), nil)
+	config := applySingBoxAPIConfig(normalizeSingBoxKeys(cloneMap(request.SingBoxConfig)), m.cfg)
+	if len(config) == 0 {
+		return wrapStartResponse(false, nil, ptrString("singBoxConfig is required for SING_BOX core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), nil)
+	}
+	if err := m.forwarding.ValidateCoreConfig(string(coreType), config); err != nil {
+		return m.coreConflictResponse(ctx, err)
+	}
+	shouldRestart = shouldRestart || !reflect.DeepEqual(m.state.SingBoxConfig(), config)
+	if shouldRestart {
+		if err := m.restartSingBox(ctx, config); err != nil {
+			return m.coreActivationFailureResponse(ctx, err, snapshot)
 		}
-		if err := m.forwarding.ValidateCoreConfig(string(coreType), config); err != nil {
-			return m.coreConflictResponse(ctx, err)
-		}
-		shouldRestart = shouldRestart || !reflect.DeepEqual(m.state.SingBoxConfig(), config)
-		if shouldRestart {
-			if err := m.restartSingBox(ctx, config); err != nil {
-				return m.coreActivationFailureResponse(ctx, err, snapshot)
-			}
-		} else {
-			m.state.SetSingBoxConfig(config)
-			m.recordUnchangedSingBoxConfig(config)
-		}
-	case state.CoreTypeXRAY:
-		config := applyXrayAPIConfig(cloneMap(request.XrayConfig), m.cfg, m.state.PluginState(), m.apiTLS)
-		if len(config) == 0 {
-			return wrapStartResponse(false, nil, ptrString("xrayConfig is required for XRAY core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), nil)
-		}
-		if err := m.forwarding.ValidateCoreConfig(string(coreType), config); err != nil {
-			return m.coreConflictResponse(ctx, err)
-		}
-		shouldRestart = shouldRestart || !reflect.DeepEqual(m.state.XrayConfig(), config)
-		m.state.SetXrayConfig(config)
-		if shouldRestart {
-			if err := m.restartXray(ctx); err != nil {
-				return wrapStartResponse(false, nil, ptrString(err.Error()), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), nil)
-			}
-		}
+	} else {
+		m.state.SetSingBoxConfig(config)
+		m.recordUnchangedSingBoxConfig(config)
 	}
 
 	m.state.SetLastHashes(request.Internals.Hashes)
 	m.refreshOnlineStatus(ctx)
-	xrayOnline, singBoxOnline := m.state.OnlineStatus()
-	started := xrayOnline
-	if coreType == state.CoreTypeSingBox {
-		started = singBoxOnline
-	}
+	started := m.state.OnlineStatus()
 	m.logger.Info("node start request handled", "core", coreType, "remote_ip", remoteIP, "restarted", shouldRestart)
 	if shouldRestart && m.UsageSnapshotActive() {
 		m.usageMu.Lock()
@@ -411,31 +328,19 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 func (m *Manager) coreActivationFailureResponse(ctx context.Context, err error, snapshot system.Snapshot) map[string]any {
 	m.refreshOnlineStatus(ctx)
 	running := m.state.RunningCoreType()
-	xrayOnline, singBoxOnline := m.state.OnlineStatus()
-	started := xrayOnline
-	if running == state.CoreTypeSingBox {
-		started = singBoxOnline
-	}
+	started := m.state.OnlineStatus()
 	return wrapStartResponse(started, m.activeVersion(running), ptrString(err.Error()), m.state.NodeVersion(), snapshot, string(running), m.coreVersions(), m.singBoxApplyResult)
 }
 
 func (m *Manager) coreConflictResponse(ctx context.Context, err error) map[string]any {
 	m.refreshOnlineStatus(ctx)
 	running := m.state.RunningCoreType()
-	xrayOnline, singBoxOnline := m.state.OnlineStatus()
-	started := xrayOnline
-	if running == state.CoreTypeSingBox {
-		started = singBoxOnline
-	}
+	started := m.state.OnlineStatus()
 	return wrapStartResponse(started, m.activeVersion(running), ptrString(err.Error()), m.state.NodeVersion(), system.SystemSnapshot(m.network), string(running), m.coreVersions(), nil)
 }
 
 func (m *Manager) shouldRestartCore(coreType state.CoreType, force bool, hashes state.StartHashes) bool {
-	xrayOnline, singBoxOnline := m.state.OnlineStatus()
-	targetOnline := xrayOnline
-	if coreType == state.CoreTypeSingBox {
-		targetOnline = singBoxOnline
-	}
+	targetOnline := m.state.OnlineStatus()
 	return force ||
 		m.cfg.DisableHashCheck ||
 		m.state.RunningCoreType() != coreType ||
@@ -447,10 +352,9 @@ func (m *Manager) Stop(ctx context.Context) map[string]any {
 	m.coreMu.Lock()
 	defer m.coreMu.Unlock()
 
-	_ = m.supervisor.StopProcess(ctx, xrayProcessName)
 	_ = m.supervisor.StopProcess(ctx, singBoxProcessName)
 	m.state.SetRunningCore("")
-	m.state.SetOnlineStatus(false, false)
+	m.state.SetOnlineStatus(false)
 	m.state.Reset()
 	return map[string]any{"response": map[string]any{"isStopped": true}}
 }
@@ -460,18 +364,19 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 	runtimeStatus := m.runtimeStatus(ctx)
 	return map[string]any{
 		"response": map[string]any{
-			"isAlive":                  true,
+			"isAlive":        true,
+			"runningCore":    runtimeStatus.RunningCore,
+			"supportedCores": runtimeStatus.SupportedCores,
+			"coreVersions":   m.coreVersions(),
+			"nodeVersion":    m.state.NodeVersion(),
+			"capabilities":   runtimeStatus.Capabilities,
+			"runtimeMode":    runtimeStatus.Mode,
+			"coreOnline":     runtimeStatus.CoreOnline,
+			"forwarding":     runtimeStatus.Forwarding,
+			"usageSnapshot":  runtimeStatus.UsageSnapshot,
+			// Deprecated aliases retained for one Backend release.
 			"xrayInternalStatusCached": runtimeStatus.CoreOnline,
-			"xrayVersion":              derefString(m.activeVersion(state.CoreTypeXRAY)),
-			"runningCore":              runtimeStatus.RunningCore,
-			"supportedCores":           runtimeStatus.SupportedCores,
-			"coreVersions":             m.coreVersions(),
-			"nodeVersion":              m.state.NodeVersion(),
-			"capabilities":             runtimeStatus.Capabilities,
-			"runtimeMode":              runtimeStatus.Mode,
-			"coreOnline":               runtimeStatus.CoreOnline,
-			"forwarding":               runtimeStatus.Forwarding,
-			"usageSnapshot":            runtimeStatus.UsageSnapshot,
+			"xrayVersion":              nil,
 		},
 	}
 }
@@ -516,14 +421,10 @@ func (m *Manager) RefreshForwardingDNS(ctx context.Context) {
 }
 
 func (m *Manager) currentCoreListeners() []forwarding.Listener {
-	switch m.state.RunningCoreType() {
-	case state.CoreTypeSingBox:
+	if m.state.RunningCoreType() == state.CoreTypeSingBox {
 		return forwarding.ExtractCoreListeners(string(state.CoreTypeSingBox), m.state.SingBoxConfig())
-	case state.CoreTypeXRAY:
-		return forwarding.ExtractCoreListeners(string(state.CoreTypeXRAY), m.state.XrayConfig())
-	default:
-		return nil
 	}
+	return nil
 }
 
 func (m *Manager) UsageSnapshotActive() bool {
@@ -599,9 +500,7 @@ func (m *Manager) withUsageSnapshotRuntime(status usagesnapshot.Status) usagesna
 		return status
 	}
 	runningCore := m.state.RunningCoreType()
-	xrayOnline, singBoxOnline := m.state.OnlineStatus()
-	status.Capturing = (runningCore == state.CoreTypeXRAY && xrayOnline) ||
-		(runningCore == state.CoreTypeSingBox && singBoxOnline)
+	status.Capturing = runningCore == state.CoreTypeSingBox && m.state.OnlineStatus()
 	return status
 }
 
@@ -630,10 +529,7 @@ func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Cou
 
 func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {
 	runningCore := m.state.RunningCoreType()
-	xrayOnline, singBoxOnline := m.state.OnlineStatus()
-	if runningCore == "" ||
-		(runningCore == state.CoreTypeXRAY && !xrayOnline) ||
-		(runningCore == state.CoreTypeSingBox && !singBoxOnline) {
+	if runningCore == "" || !m.state.OnlineStatus() {
 		return nil, ErrCoreUnavailable
 	}
 
@@ -676,15 +572,6 @@ func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {
 }
 
 func (m *Manager) GetUserOnlineStatus(ctx context.Context, request GetUserOnlineStatusRequest) map[string]any {
-	if m.state.RunningCoreType() != state.CoreTypeSingBox && m.xrayStats != nil {
-		for _, username := range m.statUsernamesForUser(request.Username) {
-			online, err := m.xrayStats.Online(ctx, username)
-			if err == nil && online {
-				return map[string]any{"response": map[string]any{"isOnline": true}}
-			}
-		}
-		return map[string]any{"response": map[string]any{"isOnline": false}}
-	}
 	online, err := m.userConnectionProvider().UserOnlineStatus(ctx, request.Username)
 	if err != nil {
 		online = false
@@ -756,7 +643,7 @@ func (m *Manager) statsClient() coreapi.StatsClient {
 	if m.state.RunningCoreType() == state.CoreTypeSingBox {
 		return m.singStats
 	}
-	return m.xrayStats
+	return nil
 }
 
 func (m *Manager) queryGroupedStats(ctx context.Context, kind, pattern string, reset bool) []map[string]any {
@@ -885,11 +772,6 @@ func findTagStats(items []map[string]any, kind, tag string) map[string]any {
 }
 
 func (m *Manager) GetUserIPList(ctx context.Context, request GetUserIPListRequest) map[string]any {
-	if m.state.RunningCoreType() != state.CoreTypeSingBox && m.xrayStats != nil {
-		items := m.xrayUserIPs(ctx, request.UserID)
-		sort.Slice(items, func(i, j int) bool { return items[i].LastSeen.After(items[j].LastSeen) })
-		return map[string]any{"response": map[string]any{"ips": formatSeenIPs(items)}}
-	}
 	items, err := m.userConnectionProvider().UserIPList(ctx, request.UserID)
 	if err != nil {
 		return map[string]any{"response": map[string]any{"ips": []map[string]any{}}}
@@ -898,27 +780,6 @@ func (m *Manager) GetUserIPList(ctx context.Context, request GetUserIPListReques
 }
 
 func (m *Manager) GetUsersIPList(ctx context.Context) map[string]any {
-	if m.state.RunningCoreType() != state.CoreTypeSingBox && m.xrayStats != nil {
-		users, err := m.xrayStats.OnlineUsers(ctx)
-		if err != nil {
-			return map[string]any{"response": map[string]any{"users": []map[string]any{}}}
-		}
-		all := make(map[string][]state.SeenIP, len(users))
-		for _, userID := range users {
-			ips, err := m.xrayStats.UserIPs(ctx, userID)
-			realUserID := statname.UserID(userID)
-			if err != nil {
-				if _, ok := all[realUserID]; !ok {
-					all[realUserID] = []state.SeenIP{}
-				}
-				continue
-			}
-			for ip, seen := range ips {
-				all[realUserID] = append(all[realUserID], state.SeenIP{IP: ip, LastSeen: time.Unix(seen, 0)})
-			}
-		}
-		return map[string]any{"response": map[string]any{"users": formatUserIPLists(all)}}
-	}
 	items, err := m.userConnectionProvider().UsersIPList(ctx)
 	if err != nil {
 		return map[string]any{"response": map[string]any{"users": []map[string]any{}}}
@@ -927,16 +788,6 @@ func (m *Manager) GetUsersIPList(ctx context.Context) map[string]any {
 }
 
 func (m *Manager) GetInboundUsers(ctx context.Context, request GetInboundUsersRequest) map[string]any {
-	if m.state.RunningCoreType() == state.CoreTypeXRAY && m.xrayHandle != nil {
-		users, err := m.xrayHandle.InboundUsers(ctx, request.Tag)
-		if err == nil {
-			items := make([]map[string]any, 0, len(users))
-			for _, user := range users {
-				items = append(items, map[string]any{"username": statname.UserID(user.Username), "level": user.Level, "protocol": user.Protocol})
-			}
-			return map[string]any{"response": map[string]any{"users": items}}
-		}
-	}
 	users := []map[string]any{}
 	for _, user := range m.state.InboundUsers(request.Tag) {
 		users = append(users, map[string]any{
@@ -948,11 +799,6 @@ func (m *Manager) GetInboundUsers(ctx context.Context, request GetInboundUsersRe
 }
 
 func (m *Manager) GetInboundUsersCount(ctx context.Context, request GetInboundUsersRequest) map[string]any {
-	if m.state.RunningCoreType() == state.CoreTypeXRAY && m.xrayHandle != nil {
-		if count, err := m.xrayHandle.InboundUsersCount(ctx, request.Tag); err == nil {
-			return map[string]any{"response": map[string]any{"count": count}}
-		}
-	}
 	return map[string]any{"response": map[string]any{"count": len(m.state.InboundUsers(request.Tag))}}
 }
 
@@ -960,15 +806,6 @@ func (m *Manager) AddUser(ctx context.Context, request AddUserRequest) map[strin
 	m.coreMu.Lock()
 	defer m.coreMu.Unlock()
 
-	if m.state.RunningCoreType() == state.CoreTypeXRAY && m.xrayHandle != nil {
-		if err := m.addXrayUsersLive(ctx, request.Data); err != nil {
-			return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
-		}
-		if err := m.applyAddUserRequest(request); err != nil {
-			return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
-		}
-		return map[string]any{"response": map[string]any{"success": true, "error": nil}}
-	}
 	if err := m.applyAddUserRequest(request); err != nil {
 		return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
 	}
@@ -982,15 +819,6 @@ func (m *Manager) AddUsers(ctx context.Context, request AddUsersRequest) map[str
 	m.coreMu.Lock()
 	defer m.coreMu.Unlock()
 
-	if m.state.RunningCoreType() == state.CoreTypeXRAY && m.xrayHandle != nil {
-		if err := m.addBulkXrayUsersLive(ctx, request); err != nil {
-			return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
-		}
-		if err := m.applyAddUsersRequest(request); err != nil {
-			return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
-		}
-		return map[string]any{"response": map[string]any{"success": true, "error": nil}}
-	}
 	if err := m.applyAddUsersRequest(request); err != nil {
 		return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
 	}
@@ -1004,17 +832,6 @@ func (m *Manager) RemoveUser(ctx context.Context, request RemoveUserRequest) map
 	m.coreMu.Lock()
 	defer m.coreMu.Unlock()
 
-	if m.state.RunningCoreType() == state.CoreTypeXRAY && m.xrayHandle != nil {
-		ips := m.xrayUserIPs(ctx, request.Username)
-		if err := m.removeXrayUserLive(ctx, request.Username); err != nil {
-			return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
-		}
-		_ = m.removeUserEverywhere(request.Username)
-		for _, item := range ips {
-			m.dropConnections(item.IP)
-		}
-		return map[string]any{"response": map[string]any{"success": true, "error": nil}}
-	}
 	if err := m.removeUserEverywhere(request.Username); err != nil {
 		return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
 	}
@@ -1028,19 +845,6 @@ func (m *Manager) RemoveUsers(ctx context.Context, request RemoveUsersRequest) m
 	m.coreMu.Lock()
 	defer m.coreMu.Unlock()
 
-	if m.state.RunningCoreType() == state.CoreTypeXRAY && m.xrayHandle != nil {
-		for _, user := range request.Users {
-			ips := m.xrayUserIPs(ctx, user.UserID)
-			if err := m.removeXrayUserLive(ctx, user.UserID); err != nil {
-				return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
-			}
-			_ = m.removeUserEverywhere(user.UserID)
-			for _, item := range ips {
-				m.dropConnections(item.IP)
-			}
-		}
-		return map[string]any{"response": map[string]any{"success": true, "error": nil}}
-	}
 	for _, user := range request.Users {
 		if err := m.removeUserEverywhere(user.UserID); err != nil {
 			return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
@@ -1072,7 +876,7 @@ func (m *Manager) DropUsersConnections(ctx context.Context, request DropUsersCon
 }
 
 func (m *Manager) userConnectionProvider() UserConnectionProvider {
-	return newUserConnectionProvider(m.cfg.XtlsAPIPort, m.cfg.SingBoxAPIPort, m.cfg.InternalRESTToken, m.state)
+	return newUserConnectionProvider(m.cfg.SingBoxAPIPort, m.cfg.InternalRESTToken)
 }
 
 func formatSeenIPs(items []state.SeenIP) []map[string]any {
@@ -1108,29 +912,11 @@ func (m *Manager) DropIPs(request DropIPsRequest) map[string]any {
 }
 
 func (m *Manager) BlockIP(ctx context.Context, request VisionIPRequest) map[string]any {
-	if m.state.RunningCoreType() != state.CoreTypeXRAY || m.xrayRoute == nil {
-		return map[string]any{"response": map[string]any{"success": false, "error": "Vision routing is only available for XRAY"}}
-	}
-	if err := m.xrayRoute.AddSourceIPRule(ctx, visionRuleTag(request.IP), "BLOCK", request.IP, true); err != nil {
-		return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
-	}
-	return map[string]any{"response": map[string]any{"success": true, "error": nil}}
+	return map[string]any{"response": map[string]any{"success": false, "error": "Vision routing is no longer supported"}}
 }
 
 func (m *Manager) UnblockIP(ctx context.Context, request VisionIPRequest) map[string]any {
-	if m.state.RunningCoreType() != state.CoreTypeXRAY || m.xrayRoute == nil {
-		return map[string]any{"response": map[string]any{"success": false, "error": "Vision routing is only available for XRAY"}}
-	}
-	if err := m.xrayRoute.RemoveRule(ctx, visionRuleTag(request.IP)); err != nil {
-		return map[string]any{"response": map[string]any{"success": false, "error": err.Error()}}
-	}
-	return map[string]any{"response": map[string]any{"success": true, "error": nil}}
-}
-
-func visionRuleTag(ip string) string {
-	value := fmt.Sprintf("string:%d:%s", len(ip), ip)
-	digest := md5.Sum([]byte(value))
-	return hex.EncodeToString(digest[:])
+	return map[string]any{"response": map[string]any{"success": false, "error": "Vision routing is no longer supported"}}
 }
 
 func (m *Manager) SyncPlugin(ctx context.Context, request PluginSyncRequest) map[string]any {
@@ -1192,7 +978,7 @@ func (m *Manager) CollectReports() map[string]any {
 	for _, report := range reports {
 		items = append(items, map[string]any{
 			"actionReport": report.ActionReport,
-			"xrayReport":   report.XrayReport,
+			"xrayReport":   report.CoreReport,
 		})
 	}
 	return map[string]any{"response": map[string]any{"reports": items}}
@@ -1270,41 +1056,16 @@ func (m *Manager) HandleWebhook(ctx context.Context, body any) {
 			"userId":        userID,
 			"processedAt":   time.Now(),
 		},
-		XrayReport: payload,
+		CoreReport: payload,
 	}
 	m.state.AddTorrentReport(report)
 }
 
 func (m *Manager) restartCurrentCore(ctx context.Context) error {
 	m.state.MarkHashesDirty()
-	switch m.state.RunningCoreType() {
-	case state.CoreTypeSingBox:
+	if m.state.RunningCoreType() == state.CoreTypeSingBox {
 		return m.restartSingBox(ctx, m.state.SingBoxConfig())
-	case state.CoreTypeXRAY:
-		return m.restartXray(ctx)
-	default:
-		return nil
 	}
-}
-
-func (m *Manager) restartXray(ctx context.Context) error {
-	if err := os.MkdirAll(filepath.Dir(m.cfg.XrayConfigPath), 0o755); err != nil {
-		return err
-	}
-	encoded, err := json.MarshalIndent(m.state.XrayConfig(), "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(m.cfg.XrayConfigPath, encoded, 0o644); err != nil {
-		return err
-	}
-	_ = m.supervisor.StopProcess(ctx, singBoxProcessName)
-	_ = m.supervisor.StopProcess(ctx, xrayProcessName)
-	if err := m.supervisor.StartProcess(ctx, xrayProcessName); err != nil {
-		return err
-	}
-	m.state.SetRunningCore(state.CoreTypeXRAY)
-	m.refreshOnlineStatus(ctx)
 	return nil
 }
 
@@ -1391,7 +1152,6 @@ func (m *Manager) restartSingBox(ctx context.Context, config map[string]any) err
 		return fmt.Errorf("sync sing-box configuration directory: %w", err)
 	}
 
-	_ = m.supervisor.StopProcess(ctx, xrayProcessName)
 	_ = m.supervisor.StopProcess(ctx, singBoxProcessName)
 	if err := m.supervisor.StartProcess(ctx, singBoxProcessName); err != nil {
 		return m.failSingBoxActivation(ctx, fmt.Errorf("start sing-box: %w", err), requestedHash, previousHash, attemptedAt, previousCore, previousRuntimeConfig, previousConfig, hadPreviousConfig, configPath, lastGoodPath)
@@ -1519,8 +1279,6 @@ func (m *Manager) rollbackSingBox(ctx context.Context, previousCore state.CoreTy
 	case state.CoreTypeSingBox:
 		m.state.SetSingBoxConfig(previousRuntimeConfig)
 		startErr = m.supervisor.StartProcess(ctx, singBoxProcessName)
-	case state.CoreTypeXRAY:
-		startErr = m.supervisor.StartProcess(ctx, xrayProcessName)
 	}
 	if startErr != nil {
 		m.state.SetRunningCore("")
@@ -1665,24 +1423,21 @@ func syncDirectory(path string) error {
 }
 
 func (m *Manager) refreshOnlineStatus(ctx context.Context) {
-	xrayInfo, _ := m.supervisor.GetProcessInfo(ctx, xrayProcessName)
 	singBoxInfo, _ := m.supervisor.GetProcessInfo(ctx, singBoxProcessName)
-	m.state.SetOnlineStatus(xrayInfo.State == supervisor.StateRunning, singBoxInfo.State == supervisor.StateRunning)
+	m.state.SetOnlineStatus(singBoxInfo.State == supervisor.StateRunning)
 }
 
 func (m *Manager) activeVersion(coreType state.CoreType) *string {
-	xrayVersion, singBoxVersion := m.state.CoreVersions()
 	if coreType == state.CoreTypeSingBox {
-		return singBoxVersion
+		return m.state.CoreVersion()
 	}
-	return xrayVersion
+	return nil
 }
 
 func (m *Manager) coreVersions() map[string]any {
-	xrayVersion, singBoxVersion := m.state.CoreVersions()
 	return map[string]any{
-		"xray":    derefString(xrayVersion),
-		"singBox": derefString(singBoxVersion),
+		"xray":    nil,
+		"singBox": derefString(m.state.CoreVersion()),
 	}
 }
 
@@ -1711,10 +1466,6 @@ func formatCoreVersion(binary, line string) string {
 
 	name := filepath.Base(binary)
 	switch name {
-	case "xray", "rw-core":
-		if len(fields) >= 2 && strings.EqualFold(fields[0], "xray") {
-			return trimVersionPrefix(fields[1])
-		}
 	case "sing-box":
 		if len(fields) >= 3 && strings.EqualFold(fields[0], "sing-box") && strings.EqualFold(fields[1], "version") {
 			version := trimVersionPrefix(fields[2])
@@ -1751,93 +1502,6 @@ func (m *Manager) applyAddUserRequest(request AddUserRequest) error {
 	return nil
 }
 
-func (m *Manager) addXrayUsersLive(ctx context.Context, users []AddUserItem) error {
-	seen := map[string]struct{}{}
-	for _, user := range users {
-		if _, ok := seen[user.Username]; !ok {
-			_ = m.removeXrayUserLive(ctx, user.Username)
-			seen[user.Username] = struct{}{}
-		}
-		statsUsername := statname.UserInbound(user.Username, user.Tag)
-		if err := m.xrayHandle.AddUser(ctx, user.Tag, coreapi.User{
-			Type: user.Type, Username: statsUsername, Password: user.Password, UUID: user.UUID,
-			Flow: user.Flow, CipherType: user.CipherType, IVCheck: user.IVCheck,
-		}); err != nil {
-			return fmt.Errorf("add Xray user %s to %s: %w", user.Username, user.Tag, err)
-		}
-	}
-	return nil
-}
-
-func (m *Manager) addBulkXrayUsersLive(ctx context.Context, request AddUsersRequest) error {
-	for _, user := range request.Users {
-		_ = m.removeXrayUserLive(ctx, user.UserData.UserID)
-		for _, inbound := range user.InboundData {
-			password := user.UserData.TrojanPassword
-			if inbound.Type == "shadowsocks" || inbound.Type == "shadowsocks22" {
-				password = user.UserData.SSPassword
-			}
-			if inbound.Type == "shadowsocks22" {
-				password = base64.StdEncoding.EncodeToString([]byte(password))
-			}
-			if inbound.Type == "hysteria" {
-				password = user.UserData.VLESSUUID
-			}
-			statsUsername := statname.UserInbound(user.UserData.UserID, inbound.Tag)
-			if err := m.xrayHandle.AddUser(ctx, inbound.Tag, coreapi.User{
-				Type: inbound.Type, Username: statsUsername, Password: password,
-				UUID: user.UserData.VLESSUUID, Flow: inbound.Flow,
-			}); err != nil {
-				return fmt.Errorf("add Xray user %s to %s: %w", user.UserData.UserID, inbound.Tag, err)
-			}
-		}
-	}
-	return nil
-}
-
-func (m *Manager) removeXrayUserLive(ctx context.Context, username string) error {
-	tags := xrayInboundTags(m.state.XrayConfig())
-	var lastErr error
-	succeeded := 0
-	for _, tag := range tags {
-		for _, statsUsername := range []string{username, statname.UserInbound(username, tag)} {
-			if err := m.xrayHandle.RemoveUser(ctx, tag, statsUsername); err != nil {
-				lastErr = err
-			} else {
-				succeeded++
-			}
-		}
-	}
-	if len(tags) > 0 && succeeded == 0 {
-		return fmt.Errorf("remove Xray user %s: %w", username, lastErr)
-	}
-	return nil
-}
-
-func (m *Manager) xrayUserIPs(ctx context.Context, username string) []state.SeenIP {
-	if m.xrayStats == nil {
-		return nil
-	}
-	seenByIP := map[string]time.Time{}
-	for _, statsUsername := range m.statUsernamesForUser(username) {
-		values, err := m.xrayStats.UserIPs(ctx, statsUsername)
-		if err != nil {
-			continue
-		}
-		for ip, seen := range values {
-			lastSeen := time.Unix(seen, 0)
-			if previous, ok := seenByIP[ip]; !ok || lastSeen.After(previous) {
-				seenByIP[ip] = lastSeen
-			}
-		}
-	}
-	items := make([]state.SeenIP, 0, len(seenByIP))
-	for ip, seen := range seenByIP {
-		items = append(items, state.SeenIP{IP: ip, LastSeen: seen})
-	}
-	return items
-}
-
 func (m *Manager) statUsernamesForUser(username string) []string {
 	values := []string{username}
 	seen := map[string]struct{}{username: {}}
@@ -1855,17 +1519,6 @@ func (m *Manager) statUsernamesForUser(username string) []string {
 		}
 	}
 	return values
-}
-
-func xrayInboundTags(config map[string]any) []string {
-	tags := []string{}
-	for _, inbound := range asMapSlice(config["inbounds"]) {
-		tag := stringValue(inbound["tag"])
-		if tag != "" && tag != xrayAPIInboundTag {
-			tags = append(tags, tag)
-		}
-	}
-	return tags
 }
 
 func (m *Manager) applyAddUsersRequest(request AddUsersRequest) error {
@@ -1904,12 +1557,8 @@ func (m *Manager) addUserToTag(item AddUserItem) error {
 			return err
 		}
 		m.state.SetSingBoxConfig(config)
-	case state.CoreTypeXRAY, "":
-		config := m.state.XrayConfig()
-		if err := addXrayUser(config, item); err != nil {
-			return err
-		}
-		m.state.SetXrayConfig(config)
+	case "":
+		return errors.New("sing-box core is not running")
 	}
 	return nil
 }
@@ -1920,10 +1569,8 @@ func (m *Manager) removeUserEverywhere(username string) error {
 		config := m.state.SingBoxConfig()
 		removeSingBoxUser(config, username)
 		m.state.SetSingBoxConfig(config)
-	case state.CoreTypeXRAY, "":
-		config := m.state.XrayConfig()
-		removeXrayUser(config, username)
-		m.state.SetXrayConfig(config)
+	case "":
+		return errors.New("sing-box core is not running")
 	}
 	return nil
 }
@@ -2120,158 +1767,6 @@ func (m *Manager) dropConnections(ip string) {
 	_, _ = exec.Command("ss", "-K", "src", ip).CombinedOutput()
 }
 
-func applyXrayAPIConfig(config map[string]any, cfg config.Config, pluginState state.PluginState, bundle *coreapi.MTLSBundle) map[string]any {
-	if len(config) == 0 {
-		return config
-	}
-	encodeXrayConfigUsers(config)
-	apiTag := ensureXrayStatsConfig(config, cfg.XtlsAPIPort, bundle)
-	routing := ensureMap(config, "routing")
-	rules := ensureSliceMap(routing, "rules")
-	if !hasXrayAPIRoute(rules, apiTag) {
-		rules = append([]map[string]any{{
-			"type":        "field",
-			"inboundTag":  []any{xrayAPIInboundTag},
-			"outboundTag": apiTag,
-		}}, rules...)
-	}
-	if pluginState.TorrentEnabled {
-		webhookURL := fmt.Sprintf("/%s:/internal/webhook?token=%s", cfg.InternalSocketPath, cfg.InternalRESTToken)
-		rule := map[string]any{
-			"protocol":    []any{"bittorrent"},
-			"outboundTag": torrentOutboundTag,
-			"webhook": map[string]any{
-				"url":           webhookURL,
-				"deduplication": 5,
-			},
-		}
-		rules = append([]map[string]any{rule}, rules...)
-		for _, existing := range rules {
-			if _, ok := pluginState.TorrentIncludeRuleTags[stringValue(existing["ruleTag"])]; ok {
-				existing["webhook"] = map[string]any{"url": webhookURL, "deduplication": 5}
-			}
-		}
-		outbounds := ensureSliceMap(config, "outbounds")
-		found := false
-		for _, outbound := range outbounds {
-			if stringValue(outbound["tag"]) == torrentOutboundTag {
-				found = true
-				break
-			}
-		}
-		if !found {
-			outbounds = append(outbounds, map[string]any{"tag": torrentOutboundTag, "protocol": "blackhole"})
-			config["outbounds"] = toAnySlice(outbounds)
-		}
-	}
-	routing["rules"] = toAnySlice(rules)
-	config["routing"] = routing
-	return config
-}
-
-func ensureXrayStatsConfig(config map[string]any, apiPort int, bundle *coreapi.MTLSBundle) string {
-	if config["stats"] == nil {
-		config["stats"] = map[string]any{}
-	}
-
-	api := ensureMap(config, "api")
-	apiTag := firstNonEmpty(stringValue(api["tag"]), xrayAPITag)
-	api["tag"] = apiTag
-	delete(api, "listen")
-	services := valueStrings(api["services"])
-	for _, service := range []string{"HandlerService", "StatsService", "RoutingService"} {
-		services = appendUniqueString(services, service)
-	}
-	api["services"] = toAnyStringSlice(services)
-	config["api"] = api
-
-	policy := ensureMap(config, "policy")
-	levels := ensureMap(policy, "levels")
-	level0 := ensureMap(levels, "0")
-	level0["statsUserUplink"] = true
-	level0["statsUserDownlink"] = true
-	level0["statsUserOnline"] = true
-
-	system := ensureMap(policy, "system")
-	system["statsInboundUplink"] = true
-	system["statsInboundDownlink"] = true
-	system["statsOutboundUplink"] = true
-	system["statsOutboundDownlink"] = true
-	policy["levels"] = levels
-	policy["system"] = system
-	config["policy"] = policy
-
-	if apiPort <= 0 {
-		return apiTag
-	}
-
-	inbounds := ensureSliceMap(config, "inbounds")
-	apiInbound := map[string]any{
-		"tag":      xrayAPIInboundTag,
-		"listen":   "127.0.0.1",
-		"port":     apiPort,
-		"protocol": "dokodemo-door",
-		"settings": map[string]any{
-			"address": "127.0.0.1",
-		},
-	}
-	if bundle != nil {
-		apiInbound["streamSettings"] = map[string]any{
-			"security": "tls",
-			"tlsSettings": map[string]any{
-				"alpn":              []any{"h2"},
-				"serverName":        coreapi.InternalServerName,
-				"disableSystemRoot": true,
-				"rejectUnknownSni":  true,
-				"certificates": []any{
-					map[string]any{"certificate": pemLines(bundle.ServerCertPEM), "key": pemLines(bundle.ServerKeyPEM)},
-					map[string]any{"usage": "verify", "certificate": pemLines(bundle.CACertPEM)},
-				},
-			},
-		}
-	}
-	replaced := false
-	for idx, inbound := range inbounds {
-		if stringValue(inbound["tag"]) != xrayAPIInboundTag && stringValue(inbound["tag"]) != apiTag {
-			continue
-		}
-		inbounds[idx] = apiInbound
-		replaced = true
-		break
-	}
-	if !replaced {
-		inbounds = append(inbounds, apiInbound)
-	}
-	config["inbounds"] = toAnySlice(inbounds)
-
-	return apiTag
-}
-
-func pemLines(value string) []any {
-	lines := strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n")
-	out := make([]any, 0, len(lines))
-	for _, line := range lines {
-		if line != "" {
-			out = append(out, line)
-		}
-	}
-	return out
-}
-
-func hasXrayAPIRoute(rules []map[string]any, apiTag string) bool {
-	for _, rule := range rules {
-		if stringValue(rule["outboundTag"]) != apiTag {
-			continue
-		}
-		for _, inboundTag := range valueStrings(rule["inboundTag"]) {
-			if inboundTag == xrayAPIInboundTag {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func applySingBoxAPIConfig(config map[string]any, cfg config.Config) map[string]any {
 	if len(config) == 0 || cfg.SingBoxAPIPort <= 0 {
 		return config
@@ -2318,26 +1813,6 @@ func applySingBoxAPIConfig(config map[string]any, cfg config.Config) map[string]
 	return config
 }
 
-func encodeXrayConfigUsers(config map[string]any) {
-	for _, inbound := range asMapSlice(config["inbounds"]) {
-		tag := stringValue(inbound["tag"])
-		if tag == "" || tag == xrayAPIInboundTag {
-			continue
-		}
-		settings := ensureMap(inbound, "settings")
-		clients := asMapSlice(settings["clients"])
-		for _, client := range clients {
-			userID := statname.UserID(firstNonEmpty(stringValue(client["email"]), stringValue(client["name"])))
-			if userID == "" {
-				continue
-			}
-			client["email"] = statname.UserInbound(userID, tag)
-		}
-		settings["clients"] = toAnySlice(clients)
-		inbound["settings"] = settings
-	}
-}
-
 func encodeSingBoxConfigUsers(config map[string]any) {
 	for _, inbound := range asMapSlice(config["inbounds"]) {
 		tag := stringValue(inbound["tag"])
@@ -2361,55 +1836,6 @@ func singBoxV2RayAPIPort(cfg config.Config) int {
 		return cfg.SingBoxV2RayAPIPort
 	}
 	return cfg.SingBoxAPIPort + 1
-}
-
-func addXrayUser(config map[string]any, item AddUserItem) error {
-	for _, inbound := range asMapSlice(config["inbounds"]) {
-		if stringValue(inbound["tag"]) != item.Tag {
-			continue
-		}
-		settings := ensureMap(inbound, "settings")
-		clients := ensureSliceMap(settings, "clients")
-		client := map[string]any{"email": statname.UserInbound(item.Username, item.Tag)}
-		switch stringValue(inbound["protocol"]) {
-		case "trojan":
-			client["password"] = item.Password
-			client["id"] = item.UUID
-		case "vless":
-			client["id"] = item.UUID
-			client["flow"] = item.Flow
-		case "hysteria":
-			client["id"] = item.Password
-			client["auth"] = item.Password
-		case "shadowsocks":
-			client["password"] = item.Password
-			client["id"] = item.UUID
-			client["method"] = cipherName(item.CipherType)
-		default:
-			return fmt.Errorf("protocol %s is not supported", stringValue(inbound["protocol"]))
-		}
-		clients = append(clients, client)
-		settings["clients"] = toAnySlice(clients)
-		inbound["settings"] = settings
-		return nil
-	}
-	return fmt.Errorf("inbound %s not found", item.Tag)
-}
-
-func removeXrayUser(config map[string]any, username string) {
-	for _, inbound := range asMapSlice(config["inbounds"]) {
-		settings := ensureMap(inbound, "settings")
-		clients := asMapSlice(settings["clients"])
-		filtered := make([]map[string]any, 0, len(clients))
-		for _, client := range clients {
-			if statname.UserID(firstNonEmpty(stringValue(client["email"]), stringValue(client["name"]))) == username {
-				continue
-			}
-			filtered = append(filtered, client)
-		}
-		settings["clients"] = toAnySlice(filtered)
-		inbound["settings"] = settings
-	}
 }
 
 func addSingBoxUser(config map[string]any, item AddUserItem) error {

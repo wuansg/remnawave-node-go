@@ -26,21 +26,6 @@ func TestExtractSingBoxListeners(t *testing.T) {
 	}
 }
 
-func TestExtractXrayListeners(t *testing.T) {
-	config := map[string]any{"inbounds": []any{
-		map[string]any{"protocol": "vless", "tag": "grpc", "port": float64(443), "streamSettings": map[string]any{"network": "grpc"}},
-		map[string]any{"protocol": "vless", "tag": "quic", "port": float64(8443), "streamSettings": map[string]any{"network": "quic"}},
-		map[string]any{"protocol": "shadowsocks", "tag": "ss", "port": float64(9000), "settings": map[string]any{"network": "tcp,udp"}},
-	}}
-	listeners := ExtractCoreListeners("XRAY", config)
-	if len(listeners) != 4 {
-		t.Fatalf("expected 4 listeners, got %#v", listeners)
-	}
-	if listeners[0].Protocol != ProtocolTCP || listeners[1].Protocol != ProtocolUDP {
-		t.Fatalf("unexpected transport inference: %#v", listeners)
-	}
-}
-
 func TestValidateRejectsProtocolOverlap(t *testing.T) {
 	service := New(t.TempDir()+"/forwarding.json", 2222, nil)
 	cfg := Config{Enabled: true, ListenInterface: "auto", Rules: []Rule{

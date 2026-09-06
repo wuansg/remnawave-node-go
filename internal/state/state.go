@@ -15,7 +15,6 @@ import (
 type CoreType string
 
 const (
-	CoreTypeXRAY    CoreType = "XRAY"
 	CoreTypeSingBox CoreType = "SING_BOX"
 )
 
@@ -48,7 +47,7 @@ type PluginMeta struct {
 
 type TorrentReport struct {
 	ActionReport map[string]any `json:"actionReport"`
-	XrayReport   any            `json:"xrayReport"`
+	CoreReport   any            `json:"xrayReport"`
 }
 
 type PluginState struct {
@@ -71,14 +70,11 @@ type PluginState struct {
 type Runtime struct {
 	mu sync.RWMutex
 
-	xrayConfig    map[string]any
 	singBoxConfig map[string]any
 	running       CoreType
 
 	nodeVer        string
-	xrayVersion    *string
 	singBoxVersion *string
-	xrayOnline     bool
 	singBoxOnline  bool
 
 	lastHashes  StartHashes
@@ -93,7 +89,6 @@ type Runtime struct {
 
 func New(nodeVersion string) *Runtime {
 	return &Runtime{
-		xrayConfig:    map[string]any{},
 		singBoxConfig: map[string]any{},
 		nodeVer:       nodeVersion,
 		inboundUsers:  map[string][]InboundUser{},
@@ -109,12 +104,6 @@ func New(nodeVersion string) *Runtime {
 	}
 }
 
-func (r *Runtime) XrayConfig() map[string]any {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return cloneMap(r.xrayConfig)
-}
-
 func (r *Runtime) SingBoxConfig() map[string]any {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -124,19 +113,7 @@ func (r *Runtime) SingBoxConfig() map[string]any {
 func (r *Runtime) CurrentConfig() map[string]any {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if r.running == CoreTypeSingBox {
-		return cloneMap(r.singBoxConfig)
-	}
-	return cloneMap(r.xrayConfig)
-}
-
-func (r *Runtime) SetXrayConfig(config map[string]any) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.xrayConfig = cloneMap(config)
-	if r.running != CoreTypeSingBox {
-		r.reindexLocked(CoreTypeXRAY, r.xrayConfig)
-	}
+	return cloneMap(r.singBoxConfig)
 }
 
 func (r *Runtime) SetSingBoxConfig(config map[string]any) {
@@ -144,7 +121,7 @@ func (r *Runtime) SetSingBoxConfig(config map[string]any) {
 	defer r.mu.Unlock()
 	r.singBoxConfig = cloneMap(config)
 	if r.running == CoreTypeSingBox {
-		r.reindexLocked(CoreTypeSingBox, r.singBoxConfig)
+		r.reindexLocked(r.singBoxConfig)
 	}
 }
 
@@ -152,12 +129,9 @@ func (r *Runtime) SetRunningCore(core CoreType) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.running = core
-	switch core {
-	case CoreTypeXRAY:
-		r.reindexLocked(CoreTypeXRAY, r.xrayConfig)
-	case CoreTypeSingBox:
-		r.reindexLocked(CoreTypeSingBox, r.singBoxConfig)
-	default:
+	if core == CoreTypeSingBox {
+		r.reindexLocked(r.singBoxConfig)
+	} else {
 		r.inboundUsers = map[string][]InboundUser{}
 		r.inboundKinds = map[string]string{}
 	}
@@ -181,30 +155,28 @@ func (r *Runtime) NodeVersion() string {
 	return r.nodeVer
 }
 
-func (r *Runtime) SetCoreVersions(xrayVersion, singBoxVersion *string) {
+func (r *Runtime) SetCoreVersion(singBoxVersion *string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.xrayVersion = clonePtr(xrayVersion)
 	r.singBoxVersion = clonePtr(singBoxVersion)
 }
 
-func (r *Runtime) CoreVersions() (*string, *string) {
+func (r *Runtime) CoreVersion() *string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return clonePtr(r.xrayVersion), clonePtr(r.singBoxVersion)
+	return clonePtr(r.singBoxVersion)
 }
 
-func (r *Runtime) SetOnlineStatus(xrayOnline, singBoxOnline bool) {
+func (r *Runtime) SetOnlineStatus(singBoxOnline bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.xrayOnline = xrayOnline
 	r.singBoxOnline = singBoxOnline
 }
 
-func (r *Runtime) OnlineStatus() (bool, bool) {
+func (r *Runtime) OnlineStatus() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.xrayOnline, r.singBoxOnline
+	return r.singBoxOnline
 }
 
 func (r *Runtime) SetLastHashes(hashes StartHashes) {
@@ -367,45 +339,16 @@ func (r *Runtime) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.running = ""
-	r.xrayOnline = false
 	r.singBoxOnline = false
 	r.inboundUsers = map[string][]InboundUser{}
 	r.inboundKinds = map[string]string{}
 	r.userIPs = map[string][]SeenIP{}
 }
 
-func (r *Runtime) reindexLocked(core CoreType, config map[string]any) {
+func (r *Runtime) reindexLocked(config map[string]any) {
 	r.inboundUsers = map[string][]InboundUser{}
 	r.inboundKinds = map[string]string{}
-	switch core {
-	case CoreTypeXRAY:
-		extractXrayInbounds(config, r.inboundUsers, r.inboundKinds)
-	case CoreTypeSingBox:
-		extractSingBoxInbounds(config, r.inboundUsers, r.inboundKinds)
-	}
-}
-
-func extractXrayInbounds(config map[string]any, target map[string][]InboundUser, kinds map[string]string) {
-	for _, inbound := range asObjectSlice(config["inbounds"]) {
-		tag := asString(inbound["tag"])
-		protocol := asString(inbound["protocol"])
-		if tag == "" || protocol == "" {
-			continue
-		}
-		kinds[tag] = protocol
-		clients := asObjectSlice(asMap(inbound["settings"])["clients"])
-		for _, client := range clients {
-			userID := firstNonEmpty(asString(client["email"]), asString(client["name"]))
-			if userID == "" {
-				continue
-			}
-			target[tag] = append(target[tag], InboundUser{
-				UserID:   statname.UserID(userID),
-				Protocol: protocol,
-				Tag:      tag,
-			})
-		}
-	}
+	extractSingBoxInbounds(config, r.inboundUsers, r.inboundKinds)
 }
 
 func extractSingBoxInbounds(config map[string]any, target map[string][]InboundUser, kinds map[string]string) {

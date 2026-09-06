@@ -17,7 +17,7 @@ func TestSingBoxStatsServiceMatchesUpstreamAPI(t *testing.T) {
 }
 
 func TestSingBoxQueryStatsRequestUsesPatternsField(t *testing.T) {
-	request := &singBoxQueryStatsRequest{Patterns: []string{"user>>>"}, Reset_: true}
+	request := &queryStatsRequest{Patterns: []string{"user>>>"}, Reset_: true}
 	wire, err := proto.Marshal(protoadapt.MessageV2Of(request))
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)

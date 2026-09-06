@@ -11,17 +11,11 @@ var validUserTypes = map[string]struct{}{
 }
 
 func (r StartRequest) Validate() error {
-	if r.CoreType == "" {
-		r.CoreType = string("XRAY")
+	if !strings.EqualFold(r.CoreType, "SING_BOX") {
+		return fmt.Errorf("coreType must be SING_BOX")
 	}
-	if !strings.EqualFold(r.CoreType, "XRAY") && !strings.EqualFold(r.CoreType, "SING_BOX") {
-		return fmt.Errorf("coreType must be XRAY or SING_BOX")
-	}
-	if strings.EqualFold(r.CoreType, "SING_BOX") && len(r.SingBoxConfig) == 0 {
+	if len(r.SingBoxConfig) == 0 {
 		return fmt.Errorf("singBoxConfig is required for SING_BOX core")
-	}
-	if !strings.EqualFold(r.CoreType, "SING_BOX") && len(r.XrayConfig) == 0 {
-		return fmt.Errorf("xrayConfig is required for XRAY core")
 	}
 	return nil
 }

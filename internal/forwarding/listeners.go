@@ -62,23 +62,6 @@ func inferProtocols(coreType string, inbound map[string]any) []Protocol {
 			return []Protocol{ProtocolTCP, ProtocolUDP}
 		}
 	}
-	if kind == "shadowsocks" {
-		if settings, ok := inbound["settings"].(map[string]any); ok {
-			if values := networkValues(settings["network"]); len(values) > 0 {
-				return values
-			}
-		}
-		return []Protocol{ProtocolTCP, ProtocolUDP}
-	}
-	if stream, ok := inbound["streamSettings"].(map[string]any); ok {
-		network := strings.ToLower(stringValue(stream["network"]))
-		switch network {
-		case "kcp", "quic":
-			return []Protocol{ProtocolUDP}
-		case "tcp", "raw", "ws", "grpc", "httpupgrade", "splithttp", "xhttp":
-			return []Protocol{ProtocolTCP}
-		}
-	}
 	return []Protocol{ProtocolTCP, ProtocolUDP}
 }
 

@@ -50,7 +50,7 @@ func TestCounterResetStartsFromNewCumulativeValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	counter.Value = 20
-	if err := store.Capture("XRAY", []Counter{counter}, time.Now()); err != nil {
+	if err := store.Capture("SING_BOX", []Counter{counter}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	pull, err := store.Pull(PullRequest{})
@@ -89,7 +89,7 @@ func TestQueueLimitNeverSilentlyDrops(t *testing.T) {
 	if _, err := store.Activate(nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Capture("XRAY", []Counter{counter}, time.Now()); err == nil {
+	if err := store.Capture("SING_BOX", []Counter{counter}, time.Now()); err == nil {
 		t.Fatal("expected explicit queue limit error")
 	}
 	status, err := store.Status()

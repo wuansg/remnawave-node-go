@@ -18,19 +18,9 @@ export INTERNAL_REST_TOKEN="${INTERNAL_REST_TOKEN:-$(generate_random 64)}"
 export INTERNAL_SOCKET_PATH="${INTERNAL_SOCKET_PATH:-/run/remnawave-internal-${RNDSTR}.sock}"
 export SUPERVISORD_SOCKET_PATH="${SUPERVISORD_SOCKET_PATH:-/run/supervisord-${RNDSTR}.sock}"
 export SUPERVISORD_PID_PATH="${SUPERVISORD_PID_PATH:-/run/supervisord-${RNDSTR}.pid}"
-export XRAY_CONFIG_PATH="${XRAY_CONFIG_PATH:-/run/remnawave/xray.json}"
 export SING_BOX_CONFIG_PATH="${SING_BOX_CONFIG_PATH:-/run/remnawave/sing-box.json}"
 
 mkdir -p /run/remnawave /var/log/supervisor
-
-if [ -n "${CUSTOM_CORE_URL:-}" ]; then
-    echo "[Entrypoint] Installing custom Xray core from ${CUSTOM_CORE_URL}"
-    if ! wget -q -O /usr/local/bin/xray "${CUSTOM_CORE_URL}"; then
-        echo "[Entrypoint] Failed to download custom core" >&2
-        exit 1
-    fi
-    chmod +x /usr/local/bin/xray
-fi
 
 supervisord -c /etc/supervisord.conf &
 sleep 1

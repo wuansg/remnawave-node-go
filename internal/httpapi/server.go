@@ -117,19 +117,26 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) registerPublic(mux *http.ServeMux) {
-	mux.HandleFunc("POST /node/xray/start", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+	startCore := s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.StartRequest
 		if !decodeJSON(w, r, &body) {
 			return
 		}
 		writeJSON(w, http.StatusOK, s.manager.Start(r.Context(), body, clientIP(r)))
-	}))
-	mux.HandleFunc("GET /node/xray/stop", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+	})
+	stopCore := s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.manager.Stop(r.Context()))
-	}))
-	mux.HandleFunc("GET /node/xray/healthcheck", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+	})
+	healthcheckCore := s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.manager.Healthcheck(r.Context()))
-	}))
+	})
+	mux.HandleFunc("POST /node/core/start", startCore)
+	mux.HandleFunc("GET /node/core/stop", stopCore)
+	mux.HandleFunc("GET /node/core/healthcheck", healthcheckCore)
+	// Compatibility aliases for Backend versions released before Agent 3.7.
+	mux.HandleFunc("POST /node/xray/start", startCore)
+	mux.HandleFunc("GET /node/xray/stop", stopCore)
+	mux.HandleFunc("GET /node/xray/healthcheck", healthcheckCore)
 	mux.HandleFunc("POST /node/forwarding/validate", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body forwarding.SyncRequest
 		if !decodeJSON(w, r, &body) {

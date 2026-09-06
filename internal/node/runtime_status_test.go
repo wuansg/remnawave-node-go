@@ -44,7 +44,7 @@ func TestUsageSnapshotRuntimeStatusSeparatesEnabledFromCapturing(t *testing.T) {
 	}
 
 	runtimeState.SetRunningCore(state.CoreTypeSingBox)
-	runtimeState.SetOnlineStatus(false, true)
+	runtimeState.SetOnlineStatus(true)
 	status = manager.withUsageSnapshotRuntime(usagesnapshot.Status{Active: true})
 	if !status.Active || !status.Capturing {
 		t.Fatalf("online sing-box status = %+v, want active and capturing", status)
@@ -66,7 +66,7 @@ func TestHealthcheckPublishesRuntimeCapabilities(t *testing.T) {
 		t.Fatalf("runningCore = %#v", response["runningCore"])
 	}
 	capabilities := response["capabilities"].([]string)
-	for _, capability := range []string{RuntimeModeCapability, SingBoxCapability, XrayCapability} {
+	for _, capability := range []string{RuntimeModeCapability, SingBoxCapability} {
 		if !slices.Contains(capabilities, capability) {
 			t.Fatalf("capabilities %v do not contain %q", capabilities, capability)
 		}
