@@ -47,7 +47,7 @@ type PluginMeta struct {
 
 type TorrentReport struct {
 	ActionReport map[string]any `json:"actionReport"`
-	CoreReport   any            `json:"xrayReport"`
+	CoreReport   any            `json:"coreReport"`
 }
 
 type PluginState struct {

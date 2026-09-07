@@ -133,10 +133,6 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 	mux.HandleFunc("POST /node/core/start", startCore)
 	mux.HandleFunc("GET /node/core/stop", stopCore)
 	mux.HandleFunc("GET /node/core/healthcheck", healthcheckCore)
-	// Compatibility aliases for Backend versions released before Agent 3.7.
-	mux.HandleFunc("POST /node/xray/start", startCore)
-	mux.HandleFunc("GET /node/xray/stop", stopCore)
-	mux.HandleFunc("GET /node/xray/healthcheck", healthcheckCore)
 	mux.HandleFunc("POST /node/forwarding/validate", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body forwarding.SyncRequest
 		if !decodeJSON(w, r, &body) {

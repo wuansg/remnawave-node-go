@@ -70,12 +70,12 @@ func TestXMLRPCFaultResponse(t *testing.T) {
 }
 
 func TestMarshalCallEscapesParams(t *testing.T) {
-	body, err := marshalCall("supervisor.getProcessInfo", `xray&"core"`)
+	body, err := marshalCall("supervisor.getProcessInfo", `core&"service"`)
 	if err != nil {
 		t.Fatalf("marshalCall: %v", err)
 	}
 	raw := string(body)
-	if !strings.Contains(raw, "xray&amp;&#34;core&#34;") {
+	if !strings.Contains(raw, "core&amp;&#34;service&#34;") {
 		t.Fatalf("escaped param missing from %s", raw)
 	}
 }

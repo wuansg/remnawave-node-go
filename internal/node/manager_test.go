@@ -430,10 +430,10 @@ func TestGetSystemStatsIncludesRunningCoreInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSystemStats() error = %v", err)
 	}
-	xrayInfo := response["response"].(map[string]any)["xrayInfo"]
-	stats, ok := xrayInfo.(map[string]any)
+	coreInfo := response["response"].(map[string]any)["coreInfo"]
+	stats, ok := coreInfo.(map[string]any)
 	if !ok {
-		t.Fatalf("xrayInfo must be an object, got %#v", xrayInfo)
+		t.Fatalf("coreInfo must be an object, got %#v", coreInfo)
 	}
 	if stats["uptime"] != uint32(42) || len(stats) != 10 {
 		t.Fatalf("unexpected running core stats: %#v", stats)

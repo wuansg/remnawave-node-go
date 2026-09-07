@@ -374,9 +374,6 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 			"coreOnline":     runtimeStatus.CoreOnline,
 			"forwarding":     runtimeStatus.Forwarding,
 			"usageSnapshot":  runtimeStatus.UsageSnapshot,
-			// Deprecated aliases retained for one Backend release.
-			"xrayInternalStatusCached": runtimeStatus.CoreOnline,
-			"xrayVersion":              nil,
 		},
 	}
 }
@@ -558,7 +555,7 @@ func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {
 	}
 	return map[string]any{
 		"response": map[string]any{
-			"xrayInfo": coreStats,
+			"coreInfo": coreStats,
 			"plugins": map[string]any{
 				"torrentBlocker": map[string]any{
 					"reportsCount": len(pluginState.TorrentReports),
@@ -978,7 +975,7 @@ func (m *Manager) CollectReports() map[string]any {
 	for _, report := range reports {
 		items = append(items, map[string]any{
 			"actionReport": report.ActionReport,
-			"xrayReport":   report.CoreReport,
+			"coreReport":   report.CoreReport,
 		})
 	}
 	return map[string]any{"response": map[string]any{"reports": items}}
@@ -1436,7 +1433,6 @@ func (m *Manager) activeVersion(coreType state.CoreType) *string {
 
 func (m *Manager) coreVersions() map[string]any {
 	return map[string]any{
-		"xray":    nil,
 		"singBox": derefString(m.state.CoreVersion()),
 	}
 }
