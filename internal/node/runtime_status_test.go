@@ -66,9 +66,16 @@ func TestHealthcheckPublishesRuntimeCapabilities(t *testing.T) {
 		t.Fatalf("runningCore = %#v", response["runningCore"])
 	}
 	capabilities := response["capabilities"].([]string)
-	for _, capability := range []string{RuntimeModeCapability, SingBoxCapability} {
+	for _, capability := range []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability} {
 		if !slices.Contains(capabilities, capability) {
 			t.Fatalf("capabilities %v do not contain %q", capabilities, capability)
 		}
+	}
+	plugin := response["plugin"].(pluginRuntimeStatus)
+	if plugin.ConfigHash != "" || plugin.ActivePlugin != nil {
+		t.Fatalf("unexpected plugin state: %+v", plugin)
+	}
+	if _, ok := response["configHashes"].(state.StartHashes); !ok {
+		t.Fatalf("configHashes = %#v", response["configHashes"])
 	}
 }

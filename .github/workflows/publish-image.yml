@@ -13,7 +13,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  REMNAWAVE_NODE_VERSION: 3.8.0
+  REMNAWAVE_NODE_VERSION: 3.9.0
   SING_BOX_VERSION: 1.14.0
 
 jobs:

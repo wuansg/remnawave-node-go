@@ -53,7 +53,8 @@ type Config struct {
 }
 
 type SyncRequest struct {
-	Config Config `json:"config"`
+	Config     Config `json:"config"`
+	ConfigHash string `json:"configHash"`
 }
 
 type Listener struct {
@@ -199,7 +200,7 @@ func (s *Service) Restore(ctx context.Context) error {
 			return errors.New(s.lastError)
 		}
 		if !sameStringMap(s.resolved, prepared.resolvedTargets) {
-			if err := s.applyPreparedLocked(ctx, s.applied, prepared, true); err != nil {
+			if err := s.applyPreparedLocked(ctx, s.applied, prepared, true, s.appliedHash); err != nil {
 				s.lastError = fmt.Sprintf("refresh restored forwarding targets: %v", err)
 				return errors.New(s.lastError)
 			}
@@ -213,7 +214,7 @@ func (s *Service) Restore(ctx context.Context) error {
 		s.resolved = prepared.resolvedTargets
 		return nil
 	}
-	if err := s.applyLocked(ctx, s.applied, nil); err != nil {
+	if err := s.applyLocked(ctx, s.applied, nil, s.appliedHash); err != nil {
 		s.lastError = fmt.Sprintf("restore forwarding rules: %v", err)
 		return errors.New(s.lastError)
 	}
@@ -228,10 +229,14 @@ func (s *Service) Validate(ctx context.Context, cfg Config, coreListeners []List
 }
 
 func (s *Service) Sync(ctx context.Context, cfg Config, coreListeners []Listener) (Status, error) {
+	return s.SyncWithHash(ctx, cfg, coreListeners, "")
+}
+
+func (s *Service) SyncWithHash(ctx context.Context, cfg Config, coreListeners []Listener, desiredHash string) (Status, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cfg = normalizeConfig(cfg)
-	if err := s.applyLocked(ctx, cfg, coreListeners); err != nil {
+	if err := s.applyLocked(ctx, cfg, coreListeners, desiredHash); err != nil {
 		s.lastError = err.Error()
 		return s.statusLocked(ctx), err
 	}
@@ -276,7 +281,7 @@ func (s *Service) RefreshDNS(ctx context.Context, coreListeners []Listener) erro
 	if sameStringMap(s.resolved, prepared.resolvedTargets) {
 		return nil
 	}
-	if err := s.applyPreparedLocked(ctx, s.applied, prepared, true); err != nil {
+	if err := s.applyPreparedLocked(ctx, s.applied, prepared, true, s.appliedHash); err != nil {
 		return err
 	}
 	s.lastError = ""
@@ -303,18 +308,21 @@ func (s *Service) ValidateCoreConfig(coreType string, coreConfig map[string]any)
 	return nil
 }
 
-func (s *Service) applyLocked(ctx context.Context, cfg Config, coreListeners []Listener) error {
+func (s *Service) applyLocked(ctx context.Context, cfg Config, coreListeners []Listener, desiredHash ...string) error {
 	prepared, err := s.validateLocked(ctx, cfg, coreListeners)
 	if err != nil {
 		return err
 	}
-	return s.applyPreparedLocked(ctx, cfg, prepared, false)
+	return s.applyPreparedLocked(ctx, cfg, prepared, false, desiredHash...)
 }
 
-func (s *Service) applyPreparedLocked(ctx context.Context, cfg Config, prepared preparedConfig, skipConflicts bool) error {
+func (s *Service) applyPreparedLocked(ctx context.Context, cfg Config, prepared preparedConfig, skipConflicts bool, desiredHash ...string) error {
 	hash, err := configHash(cfg)
 	if err != nil {
 		return err
+	}
+	if len(desiredHash) > 0 && desiredHash[0] != "" {
+		hash = desiredHash[0]
 	}
 
 	if !cfg.Enabled || enabledRuleCount(cfg) == 0 {

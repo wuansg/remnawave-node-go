@@ -186,6 +186,14 @@ func (r *Runtime) SetLastHashes(hashes StartHashes) {
 	r.hashesDirty = false
 }
 
+func (r *Runtime) LastHashes() StartHashes {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := r.lastHashes
+	out.Inbounds = append([]InboundHash(nil), r.lastHashes.Inbounds...)
+	return out
+}
+
 func (r *Runtime) ShouldRestart(incoming StartHashes) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

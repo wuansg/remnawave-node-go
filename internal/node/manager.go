@@ -199,7 +199,8 @@ type VisionIPRequest struct {
 }
 
 type PluginSyncRequest struct {
-	Plugin *struct {
+	ConfigHash string `json:"configHash"`
+	Plugin     *struct {
 		Config map[string]any `json:"config"`
 		UUID   string         `json:"uuid"`
 		Name   string         `json:"name"`
@@ -374,6 +375,8 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 			"coreOnline":     runtimeStatus.CoreOnline,
 			"forwarding":     runtimeStatus.Forwarding,
 			"usageSnapshot":  runtimeStatus.UsageSnapshot,
+			"plugin":         runtimeStatus.Plugin,
+			"configHashes":   runtimeStatus.ConfigHashes,
 		},
 	}
 }
@@ -387,7 +390,7 @@ func (m *Manager) ForwardingValidate(ctx context.Context, request forwarding.Syn
 func (m *Manager) ForwardingSync(ctx context.Context, request forwarding.SyncRequest) (forwarding.Status, error) {
 	m.coreMu.Lock()
 	defer m.coreMu.Unlock()
-	return m.forwarding.Sync(ctx, request.Config, m.currentCoreListeners())
+	return m.forwarding.SyncWithHash(ctx, request.Config, m.currentCoreListeners(), request.ConfigHash)
 }
 
 func (m *Manager) ForwardingStatus(ctx context.Context) forwarding.Status {
@@ -933,7 +936,10 @@ func (m *Manager) SyncPlugin(ctx context.Context, request PluginSyncRequest) map
 	}
 
 	next := emptyPluginState()
-	next.ConfigHash = state.ConfigHash(request.Plugin.Config)
+	next.ConfigHash = request.ConfigHash
+	if next.ConfigHash == "" {
+		next.ConfigHash = state.ConfigHash(request.Plugin.Config)
+	}
 	next.ActivePlugin = &state.PluginMeta{UUID: request.Plugin.UUID, Name: request.Plugin.Name}
 	sharedLists := readSharedLists(request.Plugin.Config)
 	if err := validateSharedListReferences(request.Plugin.Config, sharedLists); err != nil {

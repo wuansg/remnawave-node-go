@@ -11,6 +11,7 @@ import (
 const (
 	RuntimeModeCapability = "runtime_mode_v1"
 	SingBoxCapability     = "core_sing_box_v1"
+	SyncStateCapability   = "sync_state_v1"
 )
 
 type RuntimeMode string
@@ -37,6 +38,13 @@ type agentRuntimeStatus struct {
 	SupportedCores []string                   `json:"supportedCores"`
 	Forwarding     forwarding.RuntimeSummary  `json:"forwarding"`
 	UsageSnapshot  usageSnapshotRuntimeStatus `json:"usageSnapshot"`
+	Plugin         pluginRuntimeStatus        `json:"plugin"`
+	ConfigHashes   state.StartHashes          `json:"configHashes"`
+}
+
+type pluginRuntimeStatus struct {
+	ConfigHash   string            `json:"configHash"`
+	ActivePlugin *state.PluginMeta `json:"activePlugin"`
 }
 
 func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
@@ -47,7 +55,7 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		State:      "unsupported",
 		DNSResults: map[string]string{},
 	}
-	capabilities := []string{RuntimeModeCapability, SingBoxCapability, "geocheck_v1"}
+	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, "geocheck_v1"}
 	if m.forwarding != nil {
 		forwardingStatus = m.forwarding.RuntimeSummary(ctx)
 		capabilities = append(capabilities, forwarding.Capability, forwarding.DNSCapability)
@@ -73,6 +81,11 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		SupportedCores: []string{string(state.CoreTypeSingBox)},
 		Forwarding:     forwardingStatus,
 		UsageSnapshot:  usageStatus,
+		Plugin: pluginRuntimeStatus{
+			ConfigHash:   m.state.PluginState().ConfigHash,
+			ActivePlugin: m.state.PluginState().ActivePlugin,
+		},
+		ConfigHashes: m.state.LastHashes(),
 	}
 }
 
