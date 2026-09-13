@@ -95,13 +95,16 @@ type Status struct {
 // health response. It deliberately omits nftables counters so frequent health
 // checks do not compete with traffic collection endpoints.
 type RuntimeSummary struct {
-	State           string            `json:"state"`
-	ConfigHash      string            `json:"configHash,omitempty"`
-	LastSyncedAt    *time.Time        `json:"lastSyncedAt,omitempty"`
-	LastError       string            `json:"lastError,omitempty"`
-	ConfiguredRules int               `json:"configuredRules"`
-	EnabledRules    int               `json:"enabledRules"`
-	DNSResults      map[string]string `json:"dnsResults"`
+	State             string            `json:"state"`
+	ConfigHash        string            `json:"configHash,omitempty"`
+	LastSyncedAt      *time.Time        `json:"lastSyncedAt,omitempty"`
+	LastError         string            `json:"lastError,omitempty"`
+	ConfiguredRules   int               `json:"configuredRules"`
+	EnabledRules      int               `json:"enabledRules"`
+	DNSResults        map[string]string `json:"dnsResults"`
+	DNSStale          bool              `json:"dnsStale"`
+	DNSLastResolvedAt *time.Time        `json:"dnsLastResolvedAt,omitempty"`
+	DNSFailureCount   uint64            `json:"dnsFailureCount"`
 }
 
 type ConflictError struct {
@@ -109,6 +112,22 @@ type ConflictError struct {
 	Port          int      `json:"port"`
 	ConflictsWith string   `json:"conflictsWith"`
 	Detail        string   `json:"detail,omitempty"`
+}
+
+type dnsResolutionError struct {
+	target string
+	err    error
+}
+
+func (e *dnsResolutionError) Error() string {
+	return fmt.Sprintf("resolve targetAddress %q: %v", e.target, e.err)
+}
+
+func (e *dnsResolutionError) Unwrap() error { return e.err }
+
+func isDNSResolutionError(err error) bool {
+	var target *dnsResolutionError
+	return errors.As(err, &target)
 }
 
 func (e *ConflictError) Error() string {
@@ -125,11 +144,14 @@ func IsConflict(err error) bool {
 }
 
 type persistedState struct {
-	Config          Config            `json:"config"`
-	AppliedHash     string            `json:"appliedHash"`
-	AppliedAt       time.Time         `json:"appliedAt"`
-	Interface       string            `json:"resolvedListenInterface"`
-	ResolvedTargets map[string]string `json:"resolvedTargets,omitempty"`
+	Config            Config            `json:"config"`
+	AppliedHash       string            `json:"appliedHash"`
+	AppliedAt         time.Time         `json:"appliedAt"`
+	Interface         string            `json:"resolvedListenInterface"`
+	ResolvedTargets   map[string]string `json:"resolvedTargets,omitempty"`
+	DNSStale          bool              `json:"dnsStale,omitempty"`
+	DNSLastResolvedAt *time.Time        `json:"dnsLastResolvedAt,omitempty"`
+	DNSFailureCount   uint64            `json:"dnsFailureCount,omitempty"`
 }
 
 type preparedConfig struct {
@@ -142,17 +164,20 @@ type preparedConfig struct {
 type lookupIPFunc func(context.Context, string, string) ([]net.IP, error)
 
 type Service struct {
-	mu          sync.Mutex
-	path        string
-	nodePort    int
-	logger      *slog.Logger
-	applied     Config
-	appliedHash string
-	appliedAt   *time.Time
-	iface       string
-	resolved    map[string]string
-	lastError   string
-	lookupIP    lookupIPFunc
+	mu                sync.Mutex
+	path              string
+	nodePort          int
+	logger            *slog.Logger
+	applied           Config
+	appliedHash       string
+	appliedAt         *time.Time
+	iface             string
+	resolved          map[string]string
+	lastError         string
+	dnsStale          bool
+	dnsLastResolvedAt *time.Time
+	dnsFailureCount   uint64
+	lookupIP          lookupIPFunc
 }
 
 func New(path string, nodePort int, logger *slog.Logger) *Service {
@@ -185,6 +210,9 @@ func (s *Service) Restore(ctx context.Context) error {
 	s.appliedAt = &persisted.AppliedAt
 	s.iface = persisted.Interface
 	s.resolved = persisted.ResolvedTargets
+	s.dnsStale = persisted.DNSStale
+	s.dnsLastResolvedAt = persisted.DNSLastResolvedAt
+	s.dnsFailureCount = persisted.DNSFailureCount
 
 	if !s.applied.Enabled || enabledRuleCount(s.applied) == 0 {
 		if err := s.reconcileHostFirewall(ctx, s.applied, "", nil); err != nil {
@@ -238,6 +266,11 @@ func (s *Service) SyncWithHash(ctx context.Context, cfg Config, coreListeners []
 	cfg = normalizeConfig(cfg)
 	if err := s.applyLocked(ctx, cfg, coreListeners, desiredHash); err != nil {
 		s.lastError = err.Error()
+		if isDNSResolutionError(err) && len(s.resolved) > 0 {
+			s.dnsStale = true
+			s.dnsFailureCount++
+			_ = s.persistCurrentLocked()
+		}
 		return s.statusLocked(ctx), err
 	}
 	s.lastError = ""
@@ -255,13 +288,16 @@ func (s *Service) RuntimeSummary(ctx context.Context) RuntimeSummary {
 	defer s.mu.Unlock()
 	state, lastError := s.runtimeStateLocked(ctx)
 	return RuntimeSummary{
-		State:           state,
-		ConfigHash:      s.appliedHash,
-		LastSyncedAt:    s.appliedAt,
-		LastError:       lastError,
-		ConfiguredRules: len(s.applied.Rules),
-		EnabledRules:    enabledRuleCount(s.applied),
-		DNSResults:      cloneStringMap(s.resolved),
+		State:             state,
+		ConfigHash:        s.appliedHash,
+		LastSyncedAt:      s.appliedAt,
+		LastError:         lastError,
+		ConfiguredRules:   len(s.applied.Rules),
+		EnabledRules:      enabledRuleCount(s.applied),
+		DNSResults:        cloneStringMap(s.resolved),
+		DNSStale:          s.dnsStale,
+		DNSLastResolvedAt: cloneTime(s.dnsLastResolvedAt),
+		DNSFailureCount:   s.dnsFailureCount,
 	}
 }
 
@@ -276,12 +312,25 @@ func (s *Service) RefreshDNS(ctx context.Context, coreListeners []Listener) erro
 	}
 	prepared, err := s.validateLocked(ctx, s.applied, coreListeners)
 	if err != nil {
+		s.lastError = err.Error()
+		if isDNSResolutionError(err) {
+			s.dnsStale = len(s.resolved) > 0
+			s.dnsFailureCount++
+		}
+		_ = s.persistCurrentLocked()
 		return err
 	}
 	if sameStringMap(s.resolved, prepared.resolvedTargets) {
+		now := time.Now().UTC()
+		s.dnsStale = false
+		s.dnsLastResolvedAt = &now
+		s.lastError = ""
+		_ = s.persistCurrentLocked()
 		return nil
 	}
 	if err := s.applyPreparedLocked(ctx, s.applied, prepared, true, s.appliedHash); err != nil {
+		s.lastError = err.Error()
+		_ = s.persistCurrentLocked()
 		return err
 	}
 	s.lastError = ""
@@ -337,6 +386,7 @@ func (s *Service) applyPreparedLocked(ctx context.Context, cfg Config, prepared 
 			return err
 		}
 		s.applied, s.appliedHash, s.appliedAt, s.iface, s.resolved = cfg, hash, &now, "", map[string]string{}
+		s.dnsStale, s.dnsLastResolvedAt, s.dnsFailureCount = false, nil, 0
 		return nil
 	}
 
@@ -362,11 +412,40 @@ func (s *Service) applyPreparedLocked(ctx context.Context, cfg Config, prepared 
 		return fmt.Errorf("apply nftables rules: %w", err)
 	}
 	now := time.Now().UTC()
-	if err := s.persist(persistedState{Config: cfg, AppliedHash: hash, AppliedAt: now, Interface: prepared.iface, ResolvedTargets: prepared.resolvedTargets}); err != nil {
+	var dnsLastResolvedAt *time.Time
+	if enabledHostnameRuleCount(cfg) > 0 {
+		dnsLastResolvedAt = &now
+	}
+	if err := s.persist(persistedState{Config: cfg, AppliedHash: hash, AppliedAt: now, Interface: prepared.iface, ResolvedTargets: prepared.resolvedTargets, DNSLastResolvedAt: dnsLastResolvedAt, DNSFailureCount: s.dnsFailureCount}); err != nil {
 		return err
 	}
 	s.applied, s.appliedHash, s.appliedAt, s.iface, s.resolved = cfg, hash, &now, prepared.iface, prepared.resolvedTargets
+	s.dnsStale, s.dnsLastResolvedAt = false, dnsLastResolvedAt
 	return nil
+}
+
+func (s *Service) persistCurrentLocked() error {
+	if s.appliedAt == nil {
+		return nil
+	}
+	return s.persist(persistedState{
+		Config:            s.applied,
+		AppliedHash:       s.appliedHash,
+		AppliedAt:         *s.appliedAt,
+		Interface:         s.iface,
+		ResolvedTargets:   s.resolved,
+		DNSStale:          s.dnsStale,
+		DNSLastResolvedAt: s.dnsLastResolvedAt,
+		DNSFailureCount:   s.dnsFailureCount,
+	})
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func (s *Service) validateLocked(ctx context.Context, cfg Config, coreListeners []Listener) (preparedConfig, error) {
@@ -600,7 +679,7 @@ func (s *Service) resolveTargetIPv4(ctx context.Context, target, preferred strin
 	}
 	ips, err := s.lookupIP(ctx, "ip4", target)
 	if err != nil {
-		return "", fmt.Errorf("resolve targetAddress %q: %w", target, err)
+		return "", &dnsResolutionError{target: target, err: err}
 	}
 	resolved := make([]string, 0, len(ips))
 	for _, ip := range ips {
@@ -613,7 +692,7 @@ func (s *Service) resolveTargetIPv4(ctx context.Context, target, preferred strin
 		}
 	}
 	if len(resolved) == 0 {
-		return "", fmt.Errorf("targetAddress %q has no routable IPv4 address", target)
+		return "", &dnsResolutionError{target: target, err: errors.New("no routable IPv4 address")}
 	}
 	return resolved[0], nil
 }

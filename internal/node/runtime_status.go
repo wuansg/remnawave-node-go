@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"time"
 
 	"github.com/remnawave/remnawave-node-go/internal/forwarding"
 	"github.com/remnawave/remnawave-node-go/internal/state"
@@ -9,9 +10,12 @@ import (
 )
 
 const (
-	RuntimeModeCapability = "runtime_mode_v1"
-	SingBoxCapability     = "core_sing_box_v1"
-	SyncStateCapability   = "sync_state_v1"
+	RuntimeModeCapability      = "runtime_mode_v1"
+	SingBoxCapability          = "core_sing_box_v1"
+	SyncStateCapability        = "sync_state_v1"
+	PluginCompileCapability    = "plugin_compile_v1"
+	PluginDNSStatusCapability  = "plugin_dns_status_v1"
+	NetworkInventoryCapability = "network_inventory_v1"
 )
 
 type RuntimeMode string
@@ -43,8 +47,12 @@ type agentRuntimeStatus struct {
 }
 
 type pluginRuntimeStatus struct {
-	ConfigHash   string            `json:"configHash"`
-	ActivePlugin *state.PluginMeta `json:"activePlugin"`
+	ConfigHash        string                            `json:"configHash"`
+	ActivePlugin      *state.PluginMeta                 `json:"activePlugin"`
+	AppliedAt         *time.Time                        `json:"appliedAt,omitempty"`
+	LastAttemptAt     *time.Time                        `json:"lastAttemptAt,omitempty"`
+	LastError         string                            `json:"lastError,omitempty"`
+	DomainResolutions map[string]state.DomainResolution `json:"domainResolutions"`
 }
 
 func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
@@ -55,7 +63,7 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		State:      "unsupported",
 		DNSResults: map[string]string{},
 	}
-	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, "geocheck_v1"}
+	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, PluginCompileCapability, PluginDNSStatusCapability, NetworkInventoryCapability, "geocheck_v1"}
 	if m.forwarding != nil {
 		forwardingStatus = m.forwarding.RuntimeSummary(ctx)
 		capabilities = append(capabilities, forwarding.Capability, forwarding.DNSCapability)
@@ -73,6 +81,7 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		runningValue = string(runningCore)
 	}
 
+	pluginState := m.state.PluginState()
 	return agentRuntimeStatus{
 		Mode:           resolveRuntimeMode(runningCore, coreOnline, forwardingStatus.State),
 		RunningCore:    runningValue,
@@ -82,8 +91,12 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		Forwarding:     forwardingStatus,
 		UsageSnapshot:  usageStatus,
 		Plugin: pluginRuntimeStatus{
-			ConfigHash:   m.state.PluginState().ConfigHash,
-			ActivePlugin: m.state.PluginState().ActivePlugin,
+			ConfigHash:        pluginState.ConfigHash,
+			ActivePlugin:      pluginState.ActivePlugin,
+			AppliedAt:         pluginState.AppliedAt,
+			LastAttemptAt:     pluginState.LastAttemptAt,
+			LastError:         pluginState.LastError,
+			DomainResolutions: pluginState.DomainResolutions,
 		},
 		ConfigHashes: m.state.LastHashes(),
 	}

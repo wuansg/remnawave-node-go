@@ -1,6 +1,9 @@
 package state
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestSingBoxProtocolsAreIndexed(t *testing.T) {
 	runtimeState := New("test")
@@ -47,5 +50,34 @@ func assertIndexedUser(t *testing.T, runtimeState *Runtime, tag, userID, protoco
 	}
 	if users[0].Protocol != protocol {
 		t.Fatalf("expected protocol %s for %s, got %s", protocol, tag, users[0].Protocol)
+	}
+}
+
+func TestPluginDomainResolutionStateIsDeepCloned(t *testing.T) {
+	now := time.Now().UTC()
+	runtimeState := New("test")
+	runtimeState.SetPluginState(PluginState{
+		DomainResolutions: map[string]DomainResolution{
+			"example.com": {
+				Domain:        "example.com",
+				Addresses:     []string{"192.0.2.1"},
+				LastAttemptAt: &now,
+				LastSuccessAt: &now,
+			},
+		},
+	})
+
+	read := runtimeState.PluginState()
+	item := read.DomainResolutions["example.com"]
+	item.Addresses[0] = "198.51.100.1"
+	item.LastSuccessAt = nil
+	read.DomainResolutions["example.com"] = item
+
+	stored := runtimeState.PluginState().DomainResolutions["example.com"]
+	if stored.Addresses[0] != "192.0.2.1" {
+		t.Fatalf("stored address was mutated through returned state: %q", stored.Addresses[0])
+	}
+	if stored.LastSuccessAt == nil {
+		t.Fatal("stored success timestamp was mutated through returned state")
 	}
 }

@@ -313,6 +313,29 @@ func TestCaptureUsageSnapshotSkipsCorelessRuntime(t *testing.T) {
 	}
 }
 
+func TestCompilePluginDoesNotMutateRuntimeState(t *testing.T) {
+	runtimeState := state.New("test")
+	manager := &Manager{state: runtimeState}
+	plugin := struct {
+		Config map[string]any `json:"config"`
+		UUID   string         `json:"uuid"`
+		Name   string         `json:"name"`
+	}{
+		Config: map[string]any{},
+		UUID:   "00000000-0000-4000-8000-000000000000",
+		Name:   "preview",
+	}
+
+	result := manager.CompilePlugin(context.Background(), PluginSyncRequest{Plugin: &plugin})
+	response := result["response"].(map[string]any)
+	if accepted, _ := response["accepted"].(bool); !accepted {
+		t.Fatalf("compile was rejected: %#v", response)
+	}
+	if runtimeState.PluginState().ConfigHash != "" {
+		t.Fatal("dry-run compile mutated the applied Plugin state")
+	}
+}
+
 func TestFormatCoreVersion(t *testing.T) {
 	t.Setenv("SING_BOX_VERSION", "v1.13.13")
 

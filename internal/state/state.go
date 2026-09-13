@@ -45,6 +45,16 @@ type PluginMeta struct {
 	Name string `json:"name"`
 }
 
+type DomainResolution struct {
+	Domain        string     `json:"domain"`
+	Addresses     []string   `json:"addresses"`
+	LastAttemptAt *time.Time `json:"lastAttemptAt,omitempty"`
+	LastSuccessAt *time.Time `json:"lastSuccessAt,omitempty"`
+	FailureCount  int        `json:"failureCount"`
+	LastError     string     `json:"lastError,omitempty"`
+	Stale         bool       `json:"stale"`
+}
+
 type TorrentReport struct {
 	ActionReport map[string]any `json:"actionReport"`
 	CoreReport   any            `json:"coreReport"`
@@ -53,6 +63,10 @@ type TorrentReport struct {
 type PluginState struct {
 	ConfigHash              string
 	ActivePlugin            *PluginMeta
+	AppliedAt               *time.Time
+	LastAttemptAt           *time.Time
+	LastError               string
+	DomainResolutions       map[string]DomainResolution
 	ConnectionDropWhitelist map[string]struct{}
 	IngressBlocked          []string
 	EgressBlockedBaseIPs    []string
@@ -96,6 +110,7 @@ func New(nodeVersion string) *Runtime {
 		userIPs:       map[string][]SeenIP{},
 		blockedIPs:    map[string]time.Time{},
 		plugin: PluginState{
+			DomainResolutions:       map[string]DomainResolution{},
 			ConnectionDropWhitelist: map[string]struct{}{},
 			TorrentIgnoredIPs:       map[string]struct{}{},
 			TorrentIgnoredUsers:     map[string]struct{}{},
@@ -423,6 +438,10 @@ func clonePtr(value *string) *string {
 func (p PluginState) clone() PluginState {
 	out := PluginState{
 		ConfigHash:              p.ConfigHash,
+		AppliedAt:               cloneTimePtr(p.AppliedAt),
+		LastAttemptAt:           cloneTimePtr(p.LastAttemptAt),
+		LastError:               p.LastError,
+		DomainResolutions:       cloneDomainResolutions(p.DomainResolutions),
 		IngressBlocked:          append([]string(nil), p.IngressBlocked...),
 		EgressBlockedBaseIPs:    append([]string(nil), p.EgressBlockedBaseIPs...),
 		EgressBlockedIPs:        append([]string(nil), p.EgressBlockedIPs...),
@@ -439,6 +458,25 @@ func (p PluginState) clone() PluginState {
 	if p.ActivePlugin != nil {
 		copied := *p.ActivePlugin
 		out.ActivePlugin = &copied
+	}
+	return out
+}
+
+func cloneTimePtr(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
+func cloneDomainResolutions(input map[string]DomainResolution) map[string]DomainResolution {
+	out := make(map[string]DomainResolution, len(input))
+	for key, value := range input {
+		value.Addresses = append([]string(nil), value.Addresses...)
+		value.LastAttemptAt = cloneTimePtr(value.LastAttemptAt)
+		value.LastSuccessAt = cloneTimePtr(value.LastSuccessAt)
+		out[key] = value
 	}
 	return out
 }

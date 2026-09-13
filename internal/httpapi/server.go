@@ -376,6 +376,13 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, s.manager.SyncPlugin(r.Context(), body))
 	}))
+	mux.HandleFunc("POST /node/plugin/compile", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		var body nodeapp.PluginSyncRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		writeJSON(w, http.StatusOK, s.manager.CompilePlugin(r.Context(), body))
+	}))
 	mux.HandleFunc("POST /node/plugin/torrent-blocker/collect", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.manager.CollectReports())
 	}))

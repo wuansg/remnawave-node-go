@@ -365,18 +365,19 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 	runtimeStatus := m.runtimeStatus(ctx)
 	return map[string]any{
 		"response": map[string]any{
-			"isAlive":        true,
-			"runningCore":    runtimeStatus.RunningCore,
-			"supportedCores": runtimeStatus.SupportedCores,
-			"coreVersions":   m.coreVersions(),
-			"nodeVersion":    m.state.NodeVersion(),
-			"capabilities":   runtimeStatus.Capabilities,
-			"runtimeMode":    runtimeStatus.Mode,
-			"coreOnline":     runtimeStatus.CoreOnline,
-			"forwarding":     runtimeStatus.Forwarding,
-			"usageSnapshot":  runtimeStatus.UsageSnapshot,
-			"plugin":         runtimeStatus.Plugin,
-			"configHashes":   runtimeStatus.ConfigHashes,
+			"isAlive":           true,
+			"runningCore":       runtimeStatus.RunningCore,
+			"supportedCores":    runtimeStatus.SupportedCores,
+			"coreVersions":      m.coreVersions(),
+			"nodeVersion":       m.state.NodeVersion(),
+			"capabilities":      runtimeStatus.Capabilities,
+			"runtimeMode":       runtimeStatus.Mode,
+			"coreOnline":        runtimeStatus.CoreOnline,
+			"forwarding":        runtimeStatus.Forwarding,
+			"usageSnapshot":     runtimeStatus.UsageSnapshot,
+			"plugin":            runtimeStatus.Plugin,
+			"configHashes":      runtimeStatus.ConfigHashes,
+			"networkInterfaces": system.NetworkInterfaces(),
 		},
 	}
 }
@@ -408,15 +409,27 @@ func (m *Manager) RefreshForwardingDNS(ctx context.Context) {
 	previousPluginState := m.state.PluginState()
 	pluginState := previousPluginState
 	previous := append([]string(nil), pluginState.EgressBlockedIPs...)
-	if err := resolveEgressDomains(refreshCtx, &pluginState); err != nil {
+	if err := resolveEgressDomains(refreshCtx, &pluginState, &previousPluginState); err != nil {
 		m.logger.Warn("failed to refresh plugin egress DNS targets", "error", err)
+		now := time.Now().UTC()
+		previousPluginState.LastAttemptAt = &now
+		previousPluginState.LastError = err.Error()
+		m.state.SetPluginState(previousPluginState)
 	} else if !reflect.DeepEqual(previous, pluginState.EgressBlockedIPs) {
 		if err := m.syncNFTState(refreshCtx, pluginState); err != nil {
 			m.logger.Warn("failed to apply refreshed plugin egress DNS targets", "error", err)
 			m.restorePluginNFTState(previousPluginState)
+			pluginState = previousPluginState
+			pluginState.LastAttemptAt = ptrTime(time.Now().UTC())
+			pluginState.LastError = err.Error()
+			m.state.SetPluginState(pluginState)
 		} else {
+			pluginState.LastError = ""
 			m.state.SetPluginState(pluginState)
 		}
+	} else {
+		pluginState.LastError = ""
+		m.state.SetPluginState(pluginState)
 	}
 }
 
@@ -926,36 +939,36 @@ func (m *Manager) SyncPlugin(ctx context.Context, request PluginSyncRequest) map
 	current := m.state.PluginState()
 	if request.Plugin == nil {
 		current = emptyPluginState()
+		now := time.Now().UTC()
+		current.LastAttemptAt = &now
 		if m.nftReady {
 			if err := m.recreateNFTables(ctx); err != nil {
-				return map[string]any{"response": map[string]any{"accepted": false}}
+				current.LastError = err.Error()
+				m.state.SetPluginState(current)
+				return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
 			}
 		}
+		current.AppliedAt = &now
 		m.state.SetPluginState(current)
-		return map[string]any{"response": map[string]any{"accepted": true}}
+		return map[string]any{"response": map[string]any{"accepted": true, "configHash": ""}}
 	}
 
-	next := emptyPluginState()
-	next.ConfigHash = request.ConfigHash
-	if next.ConfigHash == "" {
-		next.ConfigHash = state.ConfigHash(request.Plugin.Config)
-	}
-	next.ActivePlugin = &state.PluginMeta{UUID: request.Plugin.UUID, Name: request.Plugin.Name}
-	sharedLists := readSharedLists(request.Plugin.Config)
-	if err := validateSharedListReferences(request.Plugin.Config, sharedLists); err != nil {
-		return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
-	}
-	configureConnectionDrop(&next, request.Plugin.Config, sharedLists)
-	configureTorrentBlocker(&next, request.Plugin.Config, sharedLists)
-	configureIngressFilter(&next, request.Plugin.Config, sharedLists)
-	configureEgressFilter(&next, request.Plugin.Config, sharedLists)
-	if err := resolveEgressDomains(ctx, &next); err != nil {
+	next, err := compilePluginState(ctx, request, &current)
+	if err != nil {
+		now := time.Now().UTC()
+		current.LastAttemptAt = &now
+		current.LastError = err.Error()
+		m.state.SetPluginState(current)
 		return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
 	}
 
 	changedTorrent := current.TorrentEnabled != next.TorrentEnabled || current.TorrentDuration != next.TorrentDuration || !sameStringSet(current.TorrentIncludeRuleTags, next.TorrentIncludeRuleTags)
 	if m.nftReady {
 		if err := m.applyPluginNFTState(ctx, next, current); err != nil {
+			now := time.Now().UTC()
+			current.LastAttemptAt = &now
+			current.LastError = err.Error()
+			m.state.SetPluginState(current)
 			return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
 		}
 	}
@@ -969,10 +982,75 @@ func (m *Manager) SyncPlugin(ctx context.Context, request PluginSyncRequest) map
 			if rollbackErr := m.restartCurrentCore(rollbackCtx); rollbackErr != nil {
 				m.logger.Error("failed to restart core after plugin rollback", "error", rollbackErr)
 			}
-			return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
+			current.LastAttemptAt = ptrTime(time.Now().UTC())
+			current.LastError = err.Error()
+			m.state.SetPluginState(current)
+			return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error(), "rolledBack": true}}
 		}
 	}
-	return map[string]any{"response": map[string]any{"accepted": true}}
+	now := time.Now().UTC()
+	next.AppliedAt = &now
+	next.LastAttemptAt = &now
+	next.LastError = ""
+	m.state.SetPluginState(next)
+	return map[string]any{"response": map[string]any{"accepted": true, "configHash": next.ConfigHash, "appliedAt": now}}
+}
+
+func (m *Manager) CompilePlugin(ctx context.Context, request PluginSyncRequest) map[string]any {
+	m.coreMu.Lock()
+	defer m.coreMu.Unlock()
+	if request.Plugin == nil {
+		return map[string]any{"response": map[string]any{
+			"accepted": true, "configHash": "", "summary": pluginCompileSummary(emptyPluginState()),
+		}}
+	}
+	next, err := compilePluginState(ctx, request, nil)
+	if err != nil {
+		return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
+	}
+	return map[string]any{"response": map[string]any{
+		"accepted":          true,
+		"configHash":        next.ConfigHash,
+		"summary":           pluginCompileSummary(next),
+		"domainResolutions": next.DomainResolutions,
+	}}
+}
+
+func compilePluginState(ctx context.Context, request PluginSyncRequest, previous *state.PluginState) (state.PluginState, error) {
+	next := emptyPluginState()
+	now := time.Now().UTC()
+	next.LastAttemptAt = &now
+	if request.Plugin == nil {
+		return next, nil
+	}
+	next.ConfigHash = request.ConfigHash
+	if next.ConfigHash == "" {
+		next.ConfigHash = state.ConfigHash(request.Plugin.Config)
+	}
+	next.ActivePlugin = &state.PluginMeta{UUID: request.Plugin.UUID, Name: request.Plugin.Name}
+	sharedLists := readSharedLists(request.Plugin.Config)
+	if err := validateSharedListReferences(request.Plugin.Config, sharedLists); err != nil {
+		return next, err
+	}
+	configureConnectionDrop(&next, request.Plugin.Config, sharedLists)
+	configureTorrentBlocker(&next, request.Plugin.Config, sharedLists)
+	configureIngressFilter(&next, request.Plugin.Config, sharedLists)
+	configureEgressFilter(&next, request.Plugin.Config, sharedLists)
+	if err := resolveEgressDomains(ctx, &next, previous); err != nil {
+		return next, err
+	}
+	return next, nil
+}
+
+func pluginCompileSummary(plugin state.PluginState) map[string]any {
+	return map[string]any{
+		"connectionDropWhitelistIps": len(plugin.ConnectionDropWhitelist),
+		"ingressBlockedIps":          len(plugin.IngressBlocked),
+		"egressBlockedIps":           len(plugin.EgressBlockedIPs),
+		"egressBlockedDomains":       len(plugin.EgressBlockedDomains),
+		"egressBlockedPorts":         len(plugin.EgressBlockedPorts),
+		"torrentBlockerEnabled":      plugin.TorrentEnabled,
+	}
 }
 
 func (m *Manager) CollectReports() map[string]any {
@@ -1988,22 +2066,42 @@ func configureEgressFilter(target *state.PluginState, config map[string]any, sha
 	target.EgressBlockedPorts = resolvePortList(asAnySlice(plugin["blockedPorts"]), shared)
 }
 
-func resolveEgressDomains(ctx context.Context, target *state.PluginState) error {
+func resolveEgressDomains(ctx context.Context, target *state.PluginState, previous *state.PluginState) error {
 	resolved := append([]string(nil), target.EgressBlockedBaseIPs...)
+	target.DomainResolutions = map[string]state.DomainResolution{}
 	for _, domain := range target.EgressBlockedDomains {
 		if net.ParseIP(domain) != nil || strings.ContainsAny(domain, " /\\") {
 			return fmt.Errorf("invalid egress domain %q", domain)
 		}
+		now := time.Now().UTC()
+		status := state.DomainResolution{Domain: domain, LastAttemptAt: &now, Addresses: []string{}}
 		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
 		if err != nil {
+			status.LastError = err.Error()
+			status.FailureCount = 1
+			status.Stale = true
+			if previous != nil {
+				if existing, ok := previous.DomainResolutions[domain]; ok && len(existing.Addresses) > 0 {
+					status.Addresses = append([]string(nil), existing.Addresses...)
+					status.LastSuccessAt = existing.LastSuccessAt
+					status.FailureCount = existing.FailureCount + 1
+					resolved = append(resolved, status.Addresses...)
+					target.DomainResolutions[domain] = status
+					continue
+				}
+			}
 			return fmt.Errorf("resolve egress domain %q: %w", domain, err)
 		}
 		if len(ips) == 0 {
 			return fmt.Errorf("egress domain %q resolved to no addresses", domain)
 		}
 		for _, ip := range ips {
-			resolved = append(resolved, ip.String())
+			status.Addresses = append(status.Addresses, ip.String())
 		}
+		status.Addresses = uniqueStrings(status.Addresses)
+		status.LastSuccessAt = &now
+		resolved = append(resolved, status.Addresses...)
+		target.DomainResolutions[domain] = status
 	}
 	target.EgressBlockedIPs = uniqueStrings(resolved)
 	return nil
@@ -2011,12 +2109,15 @@ func resolveEgressDomains(ctx context.Context, target *state.PluginState) error 
 
 func emptyPluginState() state.PluginState {
 	return state.PluginState{
+		DomainResolutions:       map[string]state.DomainResolution{},
 		ConnectionDropWhitelist: map[string]struct{}{},
 		TorrentIgnoredIPs:       map[string]struct{}{},
 		TorrentIgnoredUsers:     map[string]struct{}{},
 		TorrentIncludeRuleTags:  map[string]struct{}{},
 	}
 }
+
+func ptrTime(value time.Time) *time.Time { return &value }
 
 func resolveIPList(values []string, shared map[string]pluginSharedList) []string {
 	out := make([]string, 0, len(values))

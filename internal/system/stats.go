@@ -2,9 +2,12 @@ package system
 
 import (
 	"bufio"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +33,21 @@ type SystemInfo struct {
 	Type              string   `json:"type"`
 	Version           string   `json:"version"`
 	NetworkInterfaces []string `json:"networkInterfaces"`
+}
+
+type NetworkAddress struct {
+	Address      string `json:"address"`
+	PrefixLength int    `json:"prefix"`
+	Family       string `json:"family"`
+}
+
+type NetworkInterfaceInfo struct {
+	Name         string           `json:"name"`
+	Index        int              `json:"index"`
+	MTU          int              `json:"mtu"`
+	Flags        []string         `json:"flags"`
+	Addresses    []NetworkAddress `json:"addresses"`
+	DefaultRoute bool             `json:"defaultRoute"`
 }
 
 type SystemStats struct {
@@ -226,25 +244,76 @@ func readProcNetDev() map[string]rawInterfaceStat {
 }
 
 func resolveDefaultInterface() string {
-	file, err := os.Open("/proc/net/route")
-	if err != nil {
-		return ""
+	for _, path := range []struct {
+		name string
+		ipv6 bool
+	}{
+		{name: "/proc/net/route"},
+		{name: "/proc/net/ipv6_route", ipv6: true},
+	} {
+		file, err := os.Open(path.name)
+		if err != nil {
+			continue
+		}
+		interfaces := parseDefaultRouteInterfaces(file, path.ipv6)
+		_ = file.Close()
+		if len(interfaces) > 0 {
+			return interfaces[0]
+		}
 	}
-	defer file.Close()
+	return ""
+}
 
-	scanner := bufio.NewScanner(file)
-	first := true
+func resolveDefaultInterfaces() map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, path := range []struct {
+		name string
+		ipv6 bool
+	}{
+		{name: "/proc/net/route"},
+		{name: "/proc/net/ipv6_route", ipv6: true},
+	} {
+		file, err := os.Open(path.name)
+		if err != nil {
+			continue
+		}
+		for _, name := range parseDefaultRouteInterfaces(file, path.ipv6) {
+			out[name] = struct{}{}
+		}
+		_ = file.Close()
+	}
+	return out
+}
+
+func parseDefaultRouteInterfaces(reader io.Reader, ipv6 bool) []string {
+	set := map[string]struct{}{}
+	out := []string{}
+	appendUnique := func(name string) {
+		if _, ok := set[name]; ok {
+			return
+		}
+		set[name] = struct{}{}
+		out = append(out, name)
+	}
+	scanner := bufio.NewScanner(reader)
+	first := !ipv6
 	for scanner.Scan() {
 		if first {
 			first = false
 			continue
 		}
 		fields := strings.Fields(scanner.Text())
-		if len(fields) >= 2 && fields[1] == "00000000" {
-			return fields[0]
+		if ipv6 {
+			if len(fields) >= 10 && fields[0] == strings.Repeat("0", 32) && fields[1] == "00" {
+				appendUnique(fields[9])
+			}
+			continue
+		}
+		if len(fields) >= 8 && fields[1] == "00000000" && fields[7] == "00000000" {
+			appendUnique(fields[0])
 		}
 	}
-	return ""
+	return out
 }
 
 func networkInterfaceNames() []string {
@@ -257,6 +326,71 @@ func networkInterfaceNames() []string {
 		out = append(out, entry.Name())
 	}
 	sortStrings(out)
+	return out
+}
+
+func NetworkInterfaces() []NetworkInterfaceInfo {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return []NetworkInterfaceInfo{}
+	}
+	defaultInterfaces := resolveDefaultInterfaces()
+	out := make([]NetworkInterfaceInfo, 0, len(interfaces))
+	for _, iface := range interfaces {
+		_, isDefault := defaultInterfaces[iface.Name]
+		item := NetworkInterfaceInfo{
+			Name:         iface.Name,
+			Index:        iface.Index,
+			MTU:          iface.MTU,
+			DefaultRoute: isDefault,
+			Flags:        interfaceFlags(iface.Flags),
+			Addresses:    []NetworkAddress{},
+		}
+		addresses, _ := iface.Addrs()
+		for _, raw := range addresses {
+			ip, network, err := net.ParseCIDR(raw.String())
+			if err != nil || ip == nil {
+				continue
+			}
+			ones, _ := network.Mask.Size()
+			family := "IPv6"
+			if ip.To4() != nil {
+				family = "IPv4"
+			}
+			item.Addresses = append(item.Addresses, NetworkAddress{
+				Address: ip.String(), PrefixLength: ones, Family: family,
+			})
+		}
+		sort.Slice(item.Addresses, func(i, j int) bool {
+			if item.Addresses[i].Family != item.Addresses[j].Family {
+				return item.Addresses[i].Family < item.Addresses[j].Family
+			}
+			return item.Addresses[i].Address < item.Addresses[j].Address
+		})
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func interfaceFlags(flags net.Flags) []string {
+	checks := []struct {
+		flag net.Flags
+		name string
+	}{
+		{net.FlagUp, "up"},
+		{net.FlagBroadcast, "broadcast"},
+		{net.FlagLoopback, "loopback"},
+		{net.FlagPointToPoint, "point-to-point"},
+		{net.FlagMulticast, "multicast"},
+		{net.FlagRunning, "running"},
+	}
+	out := make([]string, 0, len(checks))
+	for _, check := range checks {
+		if flags&check.flag != 0 {
+			out = append(out, check.name)
+		}
+	}
 	return out
 }
 

@@ -2,10 +2,13 @@ package forwarding
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExtractSingBoxListeners(t *testing.T) {
@@ -130,6 +133,46 @@ func TestResolveTargetIPv4ReportsDNSFailure(t *testing.T) {
 	_, err := service.resolveTargetIPv4(context.Background(), "missing.example.com", "")
 	if err == nil || !strings.Contains(err.Error(), "missing.example.com") {
 		t.Fatalf("expected a useful DNS error, got %v", err)
+	}
+}
+
+func TestRefreshDNSKeepsLastKnownGoodAndPersistsStaleStatus(t *testing.T) {
+	path := t.TempDir() + "/forwarding.json"
+	service := New(path, 2222, nil)
+	now := time.Now().UTC().Add(-time.Minute)
+	service.applied = Config{Enabled: true, Rules: []Rule{{
+		ID: "edge", Name: "edge", Enabled: true, Protocol: ProtocolTCP,
+		ListenPort: 55331, TargetAddress: "edge.example.com", TargetPort: 443,
+	}}}
+	service.appliedHash = "last-known-good"
+	service.appliedAt = &now
+	service.resolved = map[string]string{"edge": "198.51.100.10"}
+	service.dnsLastResolvedAt = &now
+	service.lookupIP = func(context.Context, string, string) ([]net.IP, error) {
+		return nil, errors.New("temporary resolver failure")
+	}
+
+	err := service.RefreshDNS(context.Background(), nil)
+	if err == nil || !isDNSResolutionError(err) {
+		t.Fatalf("expected classified DNS failure, got %v", err)
+	}
+	if !service.dnsStale || service.dnsFailureCount != 1 {
+		t.Fatalf("unexpected DNS status: stale=%v failures=%d", service.dnsStale, service.dnsFailureCount)
+	}
+	if got := service.resolved["edge"]; got != "198.51.100.10" {
+		t.Fatalf("last-known-good target changed to %q", got)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted persistedState
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if !persisted.DNSStale || persisted.DNSFailureCount != 1 {
+		t.Fatalf("stale DNS status was not persisted: %#v", persisted)
 	}
 }
 
