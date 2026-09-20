@@ -3,7 +3,7 @@ name: Publish Docker Image
 on:
   push:
     branches:
-      - main
+      - ops/oracle-arm64-3.11.0
   workflow_dispatch:
 
 permissions:
@@ -49,6 +49,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -65,24 +70,22 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ env.REMNAWAVE_NODE_VERSION }},priority=1000
-            type=raw,value=main,enable={{is_default_branch}},priority=200
-            type=raw,value=latest,enable={{is_default_branch}},priority=100
-            type=sha,format=short,priority=50
+            type=raw,value=${{ env.REMNAWAVE_NODE_VERSION }}-arm64,priority=1000
 
-      - name: Reject an existing immutable version tag
+      - name: Reject an existing one-off ARM64 tag
         run: |
-          if docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REMNAWAVE_NODE_VERSION }}" >/dev/null 2>&1; then
-            echo "Version tag ${{ env.REMNAWAVE_NODE_VERSION }} already exists; bump the Agent version before publishing."
+          if docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REMNAWAVE_NODE_VERSION }}-arm64" >/dev/null 2>&1; then
+            echo "One-off ARM64 tag ${{ env.REMNAWAVE_NODE_VERSION }}-arm64 already exists."
             exit 1
           fi
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          platforms: linux/arm64
           push: true
           provenance: mode=max
           sbom: true
@@ -91,3 +94,10 @@ jobs:
             SING_BOX_VERSION=${{ env.SING_BOX_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Publish combined version tag
+        run: |
+          docker buildx imagetools create \
+            --tag "${REGISTRY}/${IMAGE_NAME}:${REMNAWAVE_NODE_VERSION}" \
+            "${REGISTRY}/${IMAGE_NAME}@sha256:a3dbb9439f154a7b6aecf71a7f7edd282d4462255ec0d22c90f271084b8e7e4b" \
+            "${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
