@@ -66,10 +66,18 @@ func TestHealthcheckPublishesRuntimeCapabilities(t *testing.T) {
 		t.Fatalf("runningCore = %#v", response["runningCore"])
 	}
 	capabilities := response["capabilities"].([]string)
-	for _, capability := range []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability} {
+	for _, capability := range []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, NodeAPISNICapability} {
 		if !slices.Contains(capabilities, capability) {
 			t.Fatalf("capabilities %v do not contain %q", capabilities, capability)
 		}
+	}
+	if slices.Contains(capabilities, NodeAPISNIEnforcedCapability) {
+		t.Fatalf("capabilities %v unexpectedly contain enforced SNI while disabled", capabilities)
+	}
+	manager.cfg.NodeAPISNIEnabled = true
+	enforcedCapabilities := manager.Healthcheck(context.Background())["response"].(map[string]any)["capabilities"].([]string)
+	if !slices.Contains(enforcedCapabilities, NodeAPISNIEnforcedCapability) {
+		t.Fatalf("capabilities %v do not advertise enforced SNI", enforcedCapabilities)
 	}
 	plugin := response["plugin"].(pluginRuntimeStatus)
 	if plugin.ConfigHash != "" || plugin.ActivePlugin != nil {

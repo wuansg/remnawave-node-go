@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const defaultVersion = "3.10.0"
+const defaultVersion = "3.11.0"
 
 var buildVersion = defaultVersion
 
@@ -38,6 +38,7 @@ type Config struct {
 	UsageSnapshotInterval int
 	UsageSnapshotMaxBytes int64
 	ForwardingStatePath   string
+	NodeAPISNIEnabled     bool
 }
 
 type NodePayload struct {
@@ -79,6 +80,7 @@ func Load() (Config, error) {
 		UsageSnapshotInterval: envInt("USAGE_SNAPSHOT_INTERVAL_SECONDS", 10),
 		UsageSnapshotMaxBytes: int64(envInt("USAGE_SNAPSHOT_MAX_MIB", 256)) << 20,
 		ForwardingStatePath:   envString("FORWARDING_STATE_PATH", "/var/lib/remnanode/forwarding.json"),
+		NodeAPISNIEnabled:     envBool("NODE_API_SNI_ENABLED", false),
 	}, nil
 }
 

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -366,6 +367,7 @@ func (m *Manager) Healthcheck(ctx context.Context) map[string]any {
 	return map[string]any{
 		"response": map[string]any{
 			"isAlive":           true,
+			"architecture":      runtime.GOARCH,
 			"runningCore":       runtimeStatus.RunningCore,
 			"supportedCores":    runtimeStatus.SupportedCores,
 			"coreVersions":      m.coreVersions(),

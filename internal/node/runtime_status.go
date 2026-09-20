@@ -10,12 +10,14 @@ import (
 )
 
 const (
-	RuntimeModeCapability      = "runtime_mode_v1"
-	SingBoxCapability          = "core_sing_box_v1"
-	SyncStateCapability        = "sync_state_v1"
-	PluginCompileCapability    = "plugin_compile_v1"
-	PluginDNSStatusCapability  = "plugin_dns_status_v1"
-	NetworkInventoryCapability = "network_inventory_v1"
+	RuntimeModeCapability        = "runtime_mode_v1"
+	SingBoxCapability            = "core_sing_box_v1"
+	SyncStateCapability          = "sync_state_v1"
+	PluginCompileCapability      = "plugin_compile_v1"
+	PluginDNSStatusCapability    = "plugin_dns_status_v1"
+	NetworkInventoryCapability   = "network_inventory_v1"
+	NodeAPISNICapability         = "node_api_sni_v1"
+	NodeAPISNIEnforcedCapability = "node_api_sni_enforced_v1"
 )
 
 type RuntimeMode string
@@ -63,7 +65,10 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		State:      "unsupported",
 		DNSResults: map[string]string{},
 	}
-	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, PluginCompileCapability, PluginDNSStatusCapability, NetworkInventoryCapability, "geocheck_v1"}
+	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, PluginCompileCapability, PluginDNSStatusCapability, NetworkInventoryCapability, NodeAPISNICapability, "geocheck_v1"}
+	if m.cfg.NodeAPISNIEnabled {
+		capabilities = append(capabilities, NodeAPISNIEnforcedCapability)
+	}
 	if m.forwarding != nil {
 		forwardingStatus = m.forwarding.RuntimeSummary(ctx)
 		capabilities = append(capabilities, forwarding.Capability, forwarding.DNSCapability)

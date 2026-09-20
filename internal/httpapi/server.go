@@ -57,6 +57,28 @@ func NewServer(cfg config.Config, manager *nodeapp.Manager, logger *slog.Logger)
 		return nil, errors.New("CA certificate pool is invalid")
 	}
 
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}
+	if cfg.NodeAPISNIEnabled {
+		expectedServerName, err := auth.DeriveNodeAPIServerName(
+			cfg.NodePayload.CACertPEM,
+			cfg.NodePayload.JWTPublicKey,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("derive Node API SNI: %w", err)
+		}
+		tlsConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			if !auth.NodeAPIServerNameMatches(expectedServerName, hello.ServerName) {
+				return nil, errors.New("invalid Node API server name")
+			}
+			return nil, nil
+		}
+	}
+
 	srv := &Server{
 		cfg:      cfg,
 		logger:   logger,
@@ -76,12 +98,7 @@ func NewServer(cfg config.Config, manager *nodeapp.Manager, logger *slog.Logger)
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    64 * 1024,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			ClientCAs:    caPool,
-			ClientAuth:   tls.RequireAndVerifyClientCert,
-			MinVersion:   tls.VersionTLS12,
-		},
+		TLSConfig:         tlsConfig,
 	}
 	srv.internal = &http.Server{Handler: commonHeaders(internalMux), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 * 1024}
 
