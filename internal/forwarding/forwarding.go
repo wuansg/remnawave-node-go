@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -22,10 +23,11 @@ import (
 )
 
 const (
-	Capability    = "port_forwarding_v1"
-	DNSCapability = "port_forwarding_dns_v1"
-	TableName     = "remnanode_forward"
-	maxRules      = 64
+	Capability      = "port_forwarding_v1"
+	DNSCapability   = "port_forwarding_dns_v1"
+	UsageCapability = "port_forwarding_usage_v1"
+	TableName       = "remnanode_forward"
+	maxRules        = 64
 )
 
 type Protocol string
@@ -78,6 +80,17 @@ type RuleStatus struct {
 	ResolvedTargetAddress string             `json:"resolvedTargetAddress,omitempty"`
 	TCP                   *DirectionCounters `json:"tcp,omitempty"`
 	UDP                   *DirectionCounters `json:"udp,omitempty"`
+}
+
+// UsageCounter is a stable representation of one nftables byte counter. Scope
+// changes whenever the forwarding ruleset is reapplied, which lets the durable
+// snapshot store distinguish a real counter reset from normal traffic growth.
+type UsageCounter struct {
+	RuleID    string
+	Protocol  string
+	Direction string
+	Scope     string
+	Bytes     int64
 }
 
 type Status struct {
@@ -281,6 +294,56 @@ func (s *Service) Status(ctx context.Context) Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.statusLocked(ctx)
+}
+
+func (s *Service) UsageCounters(ctx context.Context) ([]UsageCounter, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.applied.Enabled || enabledRuleCount(s.applied) == 0 || s.appliedAt == nil {
+		return nil, false, nil
+	}
+	state, _ := s.runtimeStateLocked(ctx)
+	if state != "applied" && state != "degraded" {
+		return nil, false, nil
+	}
+	values, err := readCounters(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	scope := s.appliedHash + ":" + s.appliedAt.UTC().Format(time.RFC3339Nano)
+	result := make([]UsageCounter, 0, enabledRuleCount(s.applied)*4)
+	for _, rule := range s.applied.Rules {
+		if !rule.Enabled {
+			continue
+		}
+		for _, protocol := range expandedProtocols(rule.Protocol) {
+			prefix := counterPrefix(rule.ID, protocol)
+			if _, ok := values[prefix+"_up"]; !ok {
+				return nil, false, fmt.Errorf("forwarding counter %s_up is missing", prefix)
+			}
+			if _, ok := values[prefix+"_down"]; !ok {
+				return nil, false, fmt.Errorf("forwarding counter %s_down is missing", prefix)
+			}
+			counters := directionCounters(values, rule.ID, protocol)
+			for _, item := range []struct {
+				direction string
+				value     uint64
+			}{
+				{direction: "uplink", value: counters.Upload.Bytes},
+				{direction: "downlink", value: counters.Download.Bytes},
+			} {
+				value := item.value
+				if value > math.MaxInt64 {
+					value = math.MaxInt64
+				}
+				result = append(result, UsageCounter{
+					RuleID: rule.ID, Protocol: protocol, Direction: item.direction,
+					Scope: scope, Bytes: int64(value),
+				})
+			}
+		}
+	}
+	return result, true, nil
 }
 
 func (s *Service) RuntimeSummary(ctx context.Context) RuntimeSummary {
@@ -546,7 +609,7 @@ func (s *Service) statusLocked(ctx context.Context) Status {
 		status.State = "degraded"
 		status.LastError = "host FORWARD policy is drop; add explicit allow rules with remnanode-forward-host-allow comments for every forwarded flow"
 	}
-	counters := readCounters(ctx)
+	counters, _ := readCounters(ctx)
 	for _, rule := range s.applied.Rules {
 		if !rule.Enabled {
 			continue
@@ -1017,15 +1080,15 @@ type nftCounter struct {
 	Bytes   uint64 `json:"bytes"`
 }
 
-func readCounters(ctx context.Context) map[string]Counter {
+func readCounters(ctx context.Context) (map[string]Counter, error) {
 	result := map[string]Counter{}
 	out, err := exec.CommandContext(ctx, "nft", "-j", "list", "counters", "ip", TableName).CombinedOutput()
 	if err != nil {
-		return result
+		return nil, fmt.Errorf("read forwarding counters: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 	var doc nftJSON
-	if json.Unmarshal(out, &doc) != nil {
-		return result
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return nil, fmt.Errorf("decode forwarding counters: %w", err)
 	}
 	for _, item := range doc.NFTables {
 		raw, ok := item["counter"]
@@ -1037,7 +1100,7 @@ func readCounters(ctx context.Context) map[string]Counter {
 			result[counter.Name] = Counter{Packets: counter.Packets, Bytes: counter.Bytes}
 		}
 	}
-	return result
+	return result, nil
 }
 
 func directionCounters(values map[string]Counter, id, protocol string) DirectionCounters {

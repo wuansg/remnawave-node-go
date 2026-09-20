@@ -393,6 +393,11 @@ func (m *Manager) ForwardingValidate(ctx context.Context, request forwarding.Syn
 func (m *Manager) ForwardingSync(ctx context.Context, request forwarding.SyncRequest) (forwarding.Status, error) {
 	m.coreMu.Lock()
 	defer m.coreMu.Unlock()
+	// Seal traffic accumulated by the current nftables ruleset before it is
+	// replaced. The durable queue keeps it available while Backend is offline.
+	if err := m.captureUsageSnapshot(ctx); err != nil {
+		return m.forwarding.Status(ctx), fmt.Errorf("seal forwarding usage before sync: %w", err)
+	}
 	return m.forwarding.SyncWithHash(ctx, request.Config, m.currentCoreListeners(), request.ConfigHash)
 }
 
@@ -405,6 +410,10 @@ func (m *Manager) RefreshForwardingDNS(ctx context.Context) {
 	defer m.coreMu.Unlock()
 	refreshCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	if err := m.captureUsageSnapshot(refreshCtx); err != nil {
+		m.logger.Warn("skipping forwarding DNS refresh because usage could not be sealed", "error", err)
+		return
+	}
 	if err := m.forwarding.RefreshDNS(refreshCtx, m.currentCoreListeners()); err != nil {
 		m.logger.Warn("failed to refresh forwarding DNS targets", "error", err)
 	}
@@ -450,7 +459,7 @@ func (m *Manager) ActivateUsageSnapshots(ctx context.Context) (usagesnapshot.Sta
 	if m.usageSnapshots == nil {
 		return usagesnapshot.Status{}, errors.New("usage snapshot storage is unavailable")
 	}
-	counters, err := m.currentUsageCounters(ctx)
+	counters, _, err := m.currentUsageCounters(ctx)
 	if err != nil {
 		return usagesnapshot.Status{}, err
 	}
@@ -459,32 +468,39 @@ func (m *Manager) ActivateUsageSnapshots(ctx context.Context) (usagesnapshot.Sta
 }
 
 func (m *Manager) CaptureUsageSnapshot(ctx context.Context) {
-	if !m.UsageSnapshotActive() {
-		return
-	}
-	// Forwarding-only and idle nodes intentionally have no core stats API. Keep
-	// the snapshot generation intact so it can resume with the next core, but do
-	// not emit a false warning on every capture tick.
-	if m.state.RunningCoreType() == "" {
-		return
-	}
-	counters, err := m.currentUsageCounters(ctx)
-	if err != nil {
+	if err := m.captureUsageSnapshot(ctx); err != nil {
 		m.logger.Warn("failed to capture usage snapshot", "error", err)
-		return
+	}
+}
+
+func (m *Manager) captureUsageSnapshot(ctx context.Context) error {
+	if !m.UsageSnapshotActive() {
+		return nil
+	}
+	counters, capturing, err := m.currentUsageCounters(ctx)
+	if err != nil {
+		return err
+	}
+	if !capturing {
+		return nil
 	}
 	m.usageMu.Lock()
 	coreRestarted := m.usageCoreRestarted
 	m.usageCoreRestarted = false
 	m.usageMu.Unlock()
-	if err := m.usageSnapshots.Capture(string(m.state.RunningCoreType()), counters, time.Now(), coreRestarted); err != nil && !errors.Is(err, usagesnapshot.ErrNotActive) {
+	core := string(m.state.RunningCoreType())
+	if core == "" {
+		core = "FORWARDING_ONLY"
+	}
+	if err := m.usageSnapshots.Capture(core, counters, time.Now(), coreRestarted); err != nil && !errors.Is(err, usagesnapshot.ErrNotActive) {
 		if coreRestarted {
 			m.usageMu.Lock()
 			m.usageCoreRestarted = true
 			m.usageMu.Unlock()
 		}
-		m.logger.Error("failed to persist usage snapshot", "error", err)
+		return err
 	}
+	return nil
 }
 
 func (m *Manager) PullUsageSnapshots(request usagesnapshot.PullRequest) (usagesnapshot.PullResponse, error) {
@@ -515,16 +531,37 @@ func (m *Manager) withUsageSnapshotRuntime(status usagesnapshot.Status) usagesna
 		return status
 	}
 	runningCore := m.state.RunningCoreType()
-	status.Capturing = runningCore == state.CoreTypeSingBox && m.state.OnlineStatus()
+	forwardingStatus := forwarding.RuntimeSummary{}
+	if m.forwarding != nil {
+		forwardingStatus = m.forwarding.RuntimeSummary(context.Background())
+	}
+	status.Capturing = (runningCore == state.CoreTypeSingBox && m.state.OnlineStatus()) ||
+		(forwardingStatus.State == "applied" && forwardingStatus.EnabledRules > 0)
 	return status
 }
 
-func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Counter, error) {
+func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Counter, bool, error) {
+	result := make([]usagesnapshot.Counter, 0)
+	forwardingCounters := []forwarding.UsageCounter{}
+	forwardingActive := false
+	if m.forwarding != nil {
+		var err error
+		forwardingCounters, forwardingActive, err = m.forwarding.UsageCounters(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	for _, counter := range forwardingCounters {
+		result = append(result, usagesnapshot.Counter{
+			Kind: "forwarding", Name: counter.RuleID, Protocol: counter.Protocol,
+			Scope: counter.Scope, Direction: counter.Direction, Value: counter.Bytes,
+		})
+	}
+
 	client := m.statsClient()
 	if client == nil || m.state.RunningCoreType() == "" {
-		return nil, ErrCoreUnavailable
+		return result, forwardingActive, nil
 	}
-	result := make([]usagesnapshot.Counter, 0)
 	users := m.queryUserInboundStats(ctx, false)
 	for _, item := range users {
 		for _, direction := range []string{"uplink", "downlink"} {
@@ -539,7 +576,7 @@ func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Cou
 			}
 		}
 	}
-	return result, nil
+	return result, true, nil
 }
 
 func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {

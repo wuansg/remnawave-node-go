@@ -71,13 +71,14 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 	}
 	if m.forwarding != nil {
 		forwardingStatus = m.forwarding.RuntimeSummary(ctx)
-		capabilities = append(capabilities, forwarding.Capability, forwarding.DNSCapability)
+		capabilities = append(capabilities, forwarding.Capability, forwarding.DNSCapability, forwarding.UsageCapability)
 	}
 	usageStatus := usageSnapshotRuntimeStatus{Supported: m.usageSnapshots != nil}
 	if m.usageSnapshots != nil {
 		usageStatus.Active = m.usageSnapshots.Active()
 		usageStatus.Enabled = usageStatus.Active
-		usageStatus.Capturing = usageStatus.Active && coreOnline
+		usageStatus.Capturing = usageStatus.Active && (coreOnline ||
+			(forwardingStatus.State == "applied" && forwardingStatus.EnabledRules > 0))
 		capabilities = append(capabilities, usagesnapshot.Capability)
 	}
 

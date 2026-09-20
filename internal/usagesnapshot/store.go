@@ -32,6 +32,8 @@ type Counter struct {
 	Kind      string `json:"kind"`
 	Name      string `json:"name"`
 	Inbound   string `json:"inbound,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
+	Scope     string `json:"scope,omitempty"`
 	Direction string `json:"direction"`
 	Value     int64  `json:"value"`
 }
@@ -164,7 +166,11 @@ func (s *Store) Capture(core string, counters []Counter, capturedAt time.Time, c
 			key, current := counterKey(counter), counter.Value
 			previous := decodeInt64(baseline.Get(key))
 			delta := current - previous
-			if reset || delta < 0 {
+			// A core restart resets sing-box counters, but it does not reset
+			// nftables forwarding counters. Forwarding counters carry an apply
+			// scope in their key, so a forwarding ruleset replacement starts a
+			// fresh baseline without double counting unrelated core restarts.
+			if (reset && counter.Kind != "forwarding") || delta < 0 {
 				delta = current
 			}
 			if delta > 0 {
@@ -287,7 +293,12 @@ func (s *Store) Status() (Status, error) {
 }
 
 func counterKey(c Counter) []byte {
-	return []byte(c.Kind + "\x00" + c.Name + "\x00" + c.Inbound + "\x00" + c.Direction)
+	// Preserve the original key format for core counters so an Agent upgrade
+	// cannot replay the core's lifetime cumulative value as fresh traffic.
+	if c.Kind != "forwarding" {
+		return []byte(c.Kind + "\x00" + c.Name + "\x00" + c.Inbound + "\x00" + c.Direction)
+	}
+	return []byte(c.Kind + "\x00" + c.Name + "\x00" + c.Protocol + "\x00" + c.Scope + "\x00" + c.Direction)
 }
 func encodeInt64(v int64) []byte {
 	b := make([]byte, 8)

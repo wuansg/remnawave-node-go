@@ -79,6 +79,40 @@ func TestExplicitCoreResetDoesNotCompareAgainstOldBaseline(t *testing.T) {
 	}
 }
 
+func TestForwardingCounterSurvivesCoreResetAndUsesApplyScope(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "stats.db"), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	counter := Counter{
+		Kind: "forwarding", Name: "01989d90-cd3a-7e24-9ab2-a37b39acde11",
+		Protocol: "TCP", Scope: "apply-a", Direction: "uplink", Value: 100,
+	}
+	if _, err := store.Activate([]Counter{counter}); err != nil {
+		t.Fatal(err)
+	}
+	counter.Value = 125
+	if err := store.Capture("SING_BOX", []Counter{counter}, time.Unix(1, 0), true); err != nil {
+		t.Fatal(err)
+	}
+	counter.Scope = "apply-b"
+	counter.Value = 7
+	if err := store.Capture("FORWARDING_ONLY", []Counter{counter}, time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	pull, err := store.Pull(PullRequest{})
+	if err != nil || len(pull.Snapshots) != 2 {
+		t.Fatalf("pull: %#v %v", pull, err)
+	}
+	if got := pull.Snapshots[0].Counters[0].Value; got != 25 {
+		t.Fatalf("core reset changed forwarding delta: %d", got)
+	}
+	if got := pull.Snapshots[1].Counters[0].Value; got != 7 {
+		t.Fatalf("new apply scope did not start a fresh baseline: %d", got)
+	}
+}
+
 func TestQueueLimitNeverSilentlyDrops(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "stats.db"), 1)
 	if err != nil {
