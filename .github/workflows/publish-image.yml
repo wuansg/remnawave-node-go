@@ -13,7 +13,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  REMNAWAVE_NODE_VERSION: 3.13.0
+  REMNAWAVE_NODE_VERSION: 3.14.0
   SING_BOX_VERSION: 1.14.0
 
 jobs:
@@ -32,6 +32,17 @@ jobs:
 
       - name: Unit and race tests
         run: go test -race ./...
+
+      - name: Test patched Snell core and user traffic accounting
+        run: |
+          git clone --depth 1 --branch "v${SING_BOX_VERSION}" https://github.com/SagerNet/sing-box.git "$RUNNER_TEMP/sing-box-snell"
+          patch -d "$RUNNER_TEMP/sing-box-snell" -p1 < third_party/sing-box-patches/0001-expose-user-in-clash-connections.patch
+          patch -d "$RUNNER_TEMP/sing-box-snell" -p1 < third_party/sing-box-patches/0002-snell-multi-psk.patch
+          cd "$RUNNER_TEMP/sing-box-snell"
+          go test -race ./protocol/snell ./option
+          go build -tags with_v2ray_api,with_clash_api,with_quic -o "$RUNNER_TEMP/sing-box-test" ./cmd/sing-box
+          cd "$GITHUB_WORKSPACE"
+          SING_BOX_TEST_BINARY="$RUNNER_TEMP/sing-box-test" go test -race ./internal/node -run TestSnellIntegration -count=1
 
       - name: Vet
         run: go vet ./...

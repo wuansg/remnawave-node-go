@@ -27,14 +27,28 @@ func TestDecodeRequestBodyPlainJSON(t *testing.T) {
 }
 
 func TestDecodeJSONValidatesRequest(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"ip":"not-an-ip"}`))
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"ips":["not-an-ip"]}`))
 	recorder := httptest.NewRecorder()
-	var body nodeapp.VisionIPRequest
+	var body nodeapp.DropIPsRequest
 	if decodeJSON(recorder, req, &body) {
 		t.Fatal("invalid request unexpectedly passed validation")
 	}
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+func TestRemovedCorePluginEndpoints(t *testing.T) {
+	s := &Server{}
+	mux := http.NewServeMux()
+	s.registerPublic(mux)
+	s.registerInternal(mux)
+	for _, path := range []string{"/vision/block-ip", "/vision/unblock-ip", "/node/plugin/torrent-blocker/collect", "/internal/webhook"} {
+		recorder := httptest.NewRecorder()
+		mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, recorder.Code)
+		}
 	}
 }
 

@@ -55,30 +55,18 @@ type DomainResolution struct {
 	Stale         bool       `json:"stale"`
 }
 
-type TorrentReport struct {
-	ActionReport map[string]any `json:"actionReport"`
-	CoreReport   any            `json:"coreReport"`
-}
-
 type PluginState struct {
-	ConfigHash              string
-	ActivePlugin            *PluginMeta
-	AppliedAt               *time.Time
-	LastAttemptAt           *time.Time
-	LastError               string
-	DomainResolutions       map[string]DomainResolution
-	ConnectionDropWhitelist map[string]struct{}
-	IngressBlocked          []string
-	EgressBlockedBaseIPs    []string
-	EgressBlockedIPs        []string
-	EgressBlockedDomains    []string
-	EgressBlockedPorts      []int
-	TorrentEnabled          bool
-	TorrentDuration         int
-	TorrentIgnoredIPs       map[string]struct{}
-	TorrentIgnoredUsers     map[string]struct{}
-	TorrentIncludeRuleTags  map[string]struct{}
-	TorrentReports          []TorrentReport
+	ConfigHash           string
+	ActivePlugin         *PluginMeta
+	AppliedAt            *time.Time
+	LastAttemptAt        *time.Time
+	LastError            string
+	DomainResolutions    map[string]DomainResolution
+	IngressBlocked       []string
+	EgressBlockedBaseIPs []string
+	EgressBlockedIPs     []string
+	EgressBlockedDomains []string
+	EgressBlockedPorts   []int
 }
 
 type Runtime struct {
@@ -110,11 +98,7 @@ func New(nodeVersion string) *Runtime {
 		userIPs:       map[string][]SeenIP{},
 		blockedIPs:    map[string]time.Time{},
 		plugin: PluginState{
-			DomainResolutions:       map[string]DomainResolution{},
-			ConnectionDropWhitelist: map[string]struct{}{},
-			TorrentIgnoredIPs:       map[string]struct{}{},
-			TorrentIgnoredUsers:     map[string]struct{}{},
-			TorrentIncludeRuleTags:  map[string]struct{}{},
+			DomainResolutions: map[string]DomainResolution{},
 		},
 	}
 }
@@ -343,21 +327,6 @@ func (r *Runtime) SetPluginState(state PluginState) {
 	r.plugin = state.clone()
 }
 
-func (r *Runtime) AddTorrentReport(report TorrentReport) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.plugin.TorrentReports = append(r.plugin.TorrentReports, report)
-}
-
-func (r *Runtime) FlushTorrentReports() []TorrentReport {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]TorrentReport, len(r.plugin.TorrentReports))
-	copy(out, r.plugin.TorrentReports)
-	r.plugin.TorrentReports = nil
-	return out
-}
-
 func (r *Runtime) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -437,23 +406,16 @@ func clonePtr(value *string) *string {
 
 func (p PluginState) clone() PluginState {
 	out := PluginState{
-		ConfigHash:              p.ConfigHash,
-		AppliedAt:               cloneTimePtr(p.AppliedAt),
-		LastAttemptAt:           cloneTimePtr(p.LastAttemptAt),
-		LastError:               p.LastError,
-		DomainResolutions:       cloneDomainResolutions(p.DomainResolutions),
-		IngressBlocked:          append([]string(nil), p.IngressBlocked...),
-		EgressBlockedBaseIPs:    append([]string(nil), p.EgressBlockedBaseIPs...),
-		EgressBlockedIPs:        append([]string(nil), p.EgressBlockedIPs...),
-		EgressBlockedDomains:    append([]string(nil), p.EgressBlockedDomains...),
-		EgressBlockedPorts:      append([]int(nil), p.EgressBlockedPorts...),
-		TorrentEnabled:          p.TorrentEnabled,
-		TorrentDuration:         p.TorrentDuration,
-		TorrentReports:          append([]TorrentReport(nil), p.TorrentReports...),
-		ConnectionDropWhitelist: cloneStringSet(p.ConnectionDropWhitelist),
-		TorrentIgnoredIPs:       cloneStringSet(p.TorrentIgnoredIPs),
-		TorrentIgnoredUsers:     cloneStringSet(p.TorrentIgnoredUsers),
-		TorrentIncludeRuleTags:  cloneStringSet(p.TorrentIncludeRuleTags),
+		ConfigHash:           p.ConfigHash,
+		AppliedAt:            cloneTimePtr(p.AppliedAt),
+		LastAttemptAt:        cloneTimePtr(p.LastAttemptAt),
+		LastError:            p.LastError,
+		DomainResolutions:    cloneDomainResolutions(p.DomainResolutions),
+		IngressBlocked:       append([]string(nil), p.IngressBlocked...),
+		EgressBlockedBaseIPs: append([]string(nil), p.EgressBlockedBaseIPs...),
+		EgressBlockedIPs:     append([]string(nil), p.EgressBlockedIPs...),
+		EgressBlockedDomains: append([]string(nil), p.EgressBlockedDomains...),
+		EgressBlockedPorts:   append([]int(nil), p.EgressBlockedPorts...),
 	}
 	if p.ActivePlugin != nil {
 		copied := *p.ActivePlugin

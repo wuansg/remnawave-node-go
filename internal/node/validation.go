@@ -111,8 +111,6 @@ func (r GetUserIPListRequest) Validate() error {
 	return nil
 }
 
-func (r VisionIPRequest) Validate() error { return validateIPs([]string{r.IP}) }
-
 func (r BlockIPsRequest) Validate() error {
 	for _, item := range r.IPs {
 		if err := validateIPs([]string{item.IP}); err != nil {

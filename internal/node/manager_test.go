@@ -336,6 +336,52 @@ func TestCompilePluginDoesNotMutateRuntimeState(t *testing.T) {
 	}
 }
 
+func TestRetiredPluginsDoNotRestartCore(t *testing.T) {
+	runtimeState := state.New("test")
+	// No supervisor: an accidental core restart would fail or panic.
+	manager := &Manager{state: runtimeState}
+	plugin := struct {
+		Config map[string]any `json:"config"`
+		UUID   string         `json:"uuid"`
+		Name   string         `json:"name"`
+	}{Config: map[string]any{
+		"torrentBlocker": map[string]any{"enabled": true, "ignoreLists": map[string]any{"ip": []any{"ext:missing"}}},
+		"connectionDrop": map[string]any{"enabled": true, "whitelistIps": []any{"ext:missing"}},
+		"ingressFilter":  map[string]any{"enabled": true, "blockedIps": []any{"198.51.100.1"}},
+	}}
+	result := manager.SyncPlugin(context.Background(), PluginSyncRequest{Plugin: &plugin})
+	if result["response"].(map[string]any)["accepted"] != true {
+		t.Fatalf("legacy configuration was rejected: %#v", result)
+	}
+	if !slices.Contains(runtimeState.PluginState().IngressBlocked, "198.51.100.1") {
+		t.Fatal("shared ingress filter was lost")
+	}
+	if _, exists := pluginCompileSummary(runtimeState.PluginState())["torrentBlockerEnabled"]; exists {
+		t.Fatal("retired plugin still exposed")
+	}
+}
+
+func TestManualBlockingSurvivesPluginRemoval(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // Do not execute the host's ss command.
+	runtimeState := state.New("test")
+	manager := &Manager{state: runtimeState}
+	for _, ip := range []string{"198.51.100.2", "2001:db8::2"} {
+		if err := manager.blockIPWithTimeout(context.Background(), ip, 60); err != nil {
+			t.Fatal(err)
+		}
+		if until, ok := runtimeState.BlockedIPs()[ip]; !ok || !until.After(time.Now()) {
+			t.Fatalf("manual timed block missing for %s", ip)
+		}
+		result := manager.UnblockIPs(context.Background(), UnblockIPsRequest{IPs: []string{ip}})
+		if result["response"].(map[string]any)["accepted"] != true {
+			t.Fatalf("manual unblock failed: %#v", result)
+		}
+		if _, ok := runtimeState.BlockedIPs()[ip]; ok {
+			t.Fatal("manual unblock left runtime state")
+		}
+	}
+}
+
 func TestFormatCoreVersion(t *testing.T) {
 	t.Setenv("SING_BOX_VERSION", "v1.13.13")
 

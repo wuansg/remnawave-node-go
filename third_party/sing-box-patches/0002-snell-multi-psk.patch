@@ -1,0 +1,425 @@
+===================================================================
+--- a/option/snell.go	
++++ b/option/snell.go	
+@@ -18,8 +18,9 @@
+ 
+ type AbstractSnellInboundOptions struct {
+ 	ListenOptions
+-	PSK   string      `json:"psk"`
+-	Users []SnellUser `json:"users,omitempty"`
++	MultiUserPSK bool        `json:"multi_user_psk,omitempty"`
++	PSK          string      `json:"psk"`
++	Users        []SnellUser `json:"users,omitempty"`
+ }
+ 
+ type SnellInboundOptions _SnellInboundOptions
+@@ -134,6 +135,7 @@
+ 
+ type SnellUser struct {
+ 	Name    string `json:"name,omitempty"`
++	PSK     string `json:"psk,omitempty"`
+ 	UserKey string `json:"userkey"`
+ }
+ 
+===================================================================
+--- a/protocol/snell/inbound.go	
++++ b/protocol/snell/inbound.go	
+@@ -56,6 +56,9 @@
+ 		}
+ 	}
+ 	var err error
++	if options.MultiUserPSK && options.Version != 5 {
++		return nil, E.New("snell: multi_user_psk requires version 5")
++	}
+ 	switch options.Version {
+ 	case 5:
+ 		var obfsMode snellprotocol.ObfsMode
+@@ -68,7 +71,9 @@
+ 			ObfsMode: obfsMode,
+ 			Handler:  inbound,
+ 		}
+-		if len(options.Users) > 0 {
++		if options.MultiUserPSK {
++			inbound.service, err = newPSKService(options, inbound)
++		} else if len(options.Users) > 0 {
+ 			var service *snellv5.MultiService[int]
+ 			service, err = snellv5.NewMultiService[int](serviceOptions)
+ 			if err != nil {
+--- /dev/null
++++ b/protocol/snell/multi_psk.go
+@@ -0,0 +1,128 @@
++package snell
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	P "github.com/sagernet/sing-snell"
++	"github.com/sagernet/sing-snell/snellv5"
++	"github.com/sagernet/sing/common/auth"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++// Remnawave extension: select a standard Snell v4/v5 PSK using the first
++// authenticated record header. Framing, payload authentication and replay
++// protection remain owned by the upstream service, one instance per user.
++// This intentionally does not implement the Surge v5 QUIC proxy extension.
++const maxPSKUsers = 256
++
++type pskService struct {
++	keys       [][]byte
++	services   []*snellv5.Service
++	obfs       P.ObfsConfig
++	handshakes chan struct{}
++}
++
++func newPSKService(options option.SnellInboundOptions, handler P.Handler) (*pskService, error) {
++	if options.PSK != "" || len(options.Users) > maxPSKUsers {
++		return nil, fmt.Errorf("snell: multi_user_psk requires no shared PSK and at most %d users", maxPSKUsers)
++	}
++	mode, err := P.ParseObfsMode(options.ObfsOptions.ObfsMode)
++	if err != nil {
++		return nil, err
++	}
++	if mode != P.ObfsModeNone && mode != P.ObfsModeHTTP {
++		return nil, fmt.Errorf("snell: multi_user_psk supports only none/http obfuscation")
++	}
++	s := &pskService{obfs: P.ObfsConfig{Mode: mode}, handshakes: make(chan struct{}, 8)}
++	keys, names := map[string]bool{}, map[string]bool{}
++	for index, user := range options.Users {
++		if len(user.PSK) < 16 || len(user.PSK) > 255 || user.UserKey != "" || user.Name == "" || keys[user.PSK] || names[user.Name] {
++			return nil, fmt.Errorf("snell: invalid or duplicate PSK user at index %d", index)
++		}
++		keys[user.PSK], names[user.Name] = true, true
++		service, err := snellv5.NewService(snellv5.ServiceOptions{
++			PSK: []byte(user.PSK), Handler: pskHandler{handler},
++		})
++		if err != nil {
++			return nil, err
++		}
++		s.keys = append(s.keys, []byte(user.PSK))
++		s.services = append(s.services, service)
++	}
++	// Empty users deliberately means reject all, never shared-PSK fallback.
++	return s, nil
++}
++
++func (s *pskService) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
++	if len(s.keys) == 0 {
++		return fmt.Errorf("snell: no authorized users")
++	}
++	select {
++	case s.handshakes <- struct{}{}:
++	default:
++		return fmt.Errorf("snell: handshake capacity exceeded")
++	}
++	held := true
++	defer func() {
++		if held {
++			<-s.handshakes
++		}
++	}()
++	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
++		return err
++	}
++	conn = s.obfs.ServerConn(conn)
++	prefix := make([]byte, P.SaltLen+P.HeaderCipherLen)
++	if _, err := io.ReadFull(conn, prefix); err != nil {
++		return err
++	}
++	for index, psk := range s.keys {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		aead, err := P.NewAEAD(P.DeriveKey(psk, prefix[:P.SaltLen]))
++		if err != nil {
++			return err
++		}
++		header, err := aead.Open(nil, make([]byte, P.NonceLen), prefix[P.SaltLen:], nil)
++		if err != nil {
++			continue
++		}
++		if len(header) != P.HeaderPlainLen || header[0] != P.HeaderVersion {
++			return fmt.Errorf("snell: invalid record header")
++		}
++		cached := &pskPrefixConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(prefix), conn)}
++		// Only unauthenticated key selection consumes a slot. Upstream reusable
++		// sessions can remain alive for hours and must not monopolize this limit.
++		<-s.handshakes
++		held = false
++		return s.services[index].NewConnection(auth.ContextWithUser(ctx, index), cached, source, onClose)
++	}
++	return fmt.Errorf("snell: authentication failed")
++}
++
++type pskPrefixConn struct {
++	net.Conn
++	reader io.Reader
++}
++
++func (c *pskPrefixConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
++
++type pskHandler struct{ P.Handler }
++
++func (h pskHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++	_ = conn.SetReadDeadline(time.Time{})
++	h.Handler.NewConnectionEx(ctx, conn, source, destination, onClose)
++}
++
++func (h pskHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++	_ = conn.SetReadDeadline(time.Time{})
++	h.Handler.NewPacketConnectionEx(ctx, conn, source, destination, onClose)
++}
+--- /dev/null
++++ b/protocol/snell/multi_psk_test.go
+@@ -0,0 +1,244 @@
++package snell
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	P "github.com/sagernet/sing-snell"
++	"github.com/sagernet/sing-snell/snellv4"
++	"github.com/sagernet/sing/common/auth"
++	"github.com/sagernet/sing/common/buf"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type echoPSKHandler struct{ users chan int }
++
++func (h echoPSKHandler) NewConnectionEx(ctx context.Context, conn net.Conn, _, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
++	user, ok := auth.UserFromContext[int](ctx)
++	if !ok {
++		user = -1
++	}
++	h.users <- user
++	go func() {
++		defer conn.Close()
++		_, err := io.Copy(conn, conn)
++		if onClose != nil {
++			onClose(err)
++		}
++	}()
++}
++
++func (h echoPSKHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
++	user, ok := auth.UserFromContext[int](ctx)
++	if !ok {
++		user = -1
++	}
++	h.users <- user
++	go func() {
++		defer conn.Close()
++		b := buf.NewPacket()
++		defer b.Release()
++		destination, err := conn.ReadPacket(b)
++		if err == nil {
++			response := buf.NewSize(2048)
++			response.Resize(1024, 0)
++			_, _ = response.Write(b.Bytes())
++			err = conn.WritePacket(response, destination)
++		}
++		if onClose != nil {
++			onClose(err)
++		}
++	}()
++}
++
++func pskOptions(mode string) option.SnellInboundOptions {
++	return option.SnellInboundOptions{
++		Version: 5,
++		AbstractSnellInboundOptions: option.AbstractSnellInboundOptions{
++			MultiUserPSK: true,
++			Users: []option.SnellUser{
++				{Name: "101:snell", PSK: "user-one-secret-123456"},
++				{Name: "202:snell", PSK: "user-two-secret-123456"},
++			},
++		},
++		ObfsOptions: option.SnellObfsServerOptions{ObfsMode: mode},
++	}
++}
++
++func testPSKSession(t *testing.T, s *pskService, h echoPSKHandler, psk string, mode P.ObfsMode, want int, udp bool) {
++	t.Helper()
++	server, clientConn := net.Pipe()
++	t.Cleanup(func() { server.Close(); clientConn.Close() })
++	_ = clientConn.SetDeadline(time.Now().Add(3 * time.Second))
++	errors := make(chan error, 1)
++	go func() {
++		err := s.NewConnection(context.Background(), server, M.Socksaddr{}, nil)
++		errors <- err
++		if err != nil {
++			server.Close()
++		}
++	}()
++	client, err := snellv4.NewClient(snellv4.ClientOptions{PSK: []byte(psk), ObfsMode: mode})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if udp {
++		conn, err := client.DialPacketConn(clientConn)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer conn.Close()
++		if _, err := conn.WriteTo([]byte("hello-udp"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53}); err != nil {
++			t.Fatal(err)
++		}
++		b := make([]byte, 9)
++		n, _, err := conn.ReadFrom(b)
++		if err != nil || string(b[:n]) != "hello-udp" {
++			t.Fatalf("UDP: %q %v", b[:n], err)
++		}
++	} else {
++		conn, err := client.DialConn(clientConn, M.ParseSocksaddr("example.com:80"))
++		if err == nil {
++			_, err = conn.Write([]byte("hello-tcp"))
++		}
++		if want < 0 {
++			if err == nil {
++				_, err = io.ReadFull(conn, make([]byte, 9))
++			}
++			if err == nil {
++				t.Fatal("unauthorized PSK accepted")
++			}
++			return
++		}
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer conn.Close()
++		b := make([]byte, 9)
++		if _, err := io.ReadFull(conn, b); err != nil || string(b) != "hello-tcp" {
++			t.Fatalf("TCP: %q %v", b, err)
++		}
++	}
++	select {
++	case user := <-h.users:
++		if user != want {
++			t.Fatalf("user attribution: got %d, want %d", user, want)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("missing user attribution")
++	}
++	if len(s.handshakes) != 0 {
++		t.Fatal("authenticated session consumes handshake slot")
++	}
++}
++
++func TestMultiPSKCompatibility(t *testing.T) {
++	for _, mode := range []string{"none", "http"} {
++		t.Run(mode, func(t *testing.T) {
++			h := echoPSKHandler{users: make(chan int, 32)}
++			opts := pskOptions(mode)
++			s, err := newPSKService(opts, h)
++			if err != nil {
++				t.Fatal(err)
++			}
++			obfs, _ := P.ParseObfsMode(mode)
++			for i := 0; i < 12; i++ {
++				testPSKSession(t, s, h, opts.Users[i%2].PSK, obfs, i%2, false)
++			}
++			testPSKSession(t, s, h, opts.Users[1].PSK, obfs, 1, true)
++			testPSKSession(t, s, h, "wrong-secret-12345678", obfs, -1, false)
++			// A fresh config with user 2 removed must not authenticate their PSK.
++			opts.Users = opts.Users[:1]
++			s, err = newPSKService(opts, h)
++			if err != nil {
++				t.Fatal(err)
++			}
++			testPSKSession(t, s, h, "user-two-secret-123456", obfs, -1, false)
++		})
++	}
++}
++
++func TestMultiPSKValidation(t *testing.T) {
++	h := echoPSKHandler{users: make(chan int, 1)}
++	for _, mutate := range []func(*option.SnellInboundOptions){
++		func(o *option.SnellInboundOptions) { o.PSK = "shared-password" },
++		func(o *option.SnellInboundOptions) { o.Users[1].PSK = o.Users[0].PSK },
++		func(o *option.SnellInboundOptions) { o.Users[0].PSK = "short" },
++		func(o *option.SnellInboundOptions) { o.Users[0].UserKey = "ambiguous" },
++		func(o *option.SnellInboundOptions) { o.Users[0].Name = "" },
++		func(o *option.SnellInboundOptions) { o.Users = make([]option.SnellUser, maxPSKUsers+1) },
++	} {
++		opts := pskOptions("none")
++		mutate(&opts)
++		if _, err := newPSKService(opts, h); err == nil {
++			t.Fatal("invalid config accepted")
++		}
++	}
++	opts := pskOptions("none")
++	opts.Users = nil
++	s, err := newPSKService(opts, h)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := s.NewConnection(context.Background(), nil, M.Socksaddr{}, nil); err == nil {
++		t.Fatal("empty users accepted")
++	}
++}
++
++// Replay an authentic header+request. The upstream per-user salt cache must
++// still reject it; the PSK selector must not replace that authentication path.
++func TestMultiPSKReplayAndTampering(t *testing.T) {
++	h := echoPSKHandler{users: make(chan int, 4)}
++	opts := pskOptions("none")
++	s, _ := newPSKService(opts, h)
++	recording := &capturePSKConn{}
++	client, _ := snellv4.NewClient(snellv4.ClientOptions{PSK: []byte(opts.Users[0].PSK)})
++	_, err := client.DialConn(recording, M.ParseSocksaddr("example.com:80"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	request := append([]byte(nil), recording.Bytes()...)
++	serve := func(data []byte) error {
++		server, peer := net.Pipe()
++		defer server.Close()
++		defer peer.Close()
++		_ = server.SetDeadline(time.Now().Add(time.Second))
++		go func() { _, _ = peer.Write(data); peer.Close() }()
++		return s.NewConnection(context.Background(), server, M.Socksaddr{}, nil)
++	}
++	tampered := append([]byte(nil), request...)
++	tampered[len(tampered)-1] ^= 1
++	if err := serve(tampered); err == nil {
++		t.Fatal("tampered payload accepted")
++	}
++	// Tampered authenticated headers consume the salt in the upstream cache,
++	// so use a fresh service for the valid/replay pair.
++	s, _ = newPSKService(opts, h)
++	_ = serve(request)
++	select {
++	case user := <-h.users:
++		if user != 0 {
++			t.Fatal(user)
++		}
++	default:
++		t.Fatal("valid request rejected")
++	}
++	if err := serve(request); err == nil || !strings.Contains(err.Error(), "duplicated salt") {
++		t.Fatalf("replay not rejected: %v", err)
++	}
++}
++
++type capturePSKConn struct {
++	net.Conn
++	bytes.Buffer
++}
++
++func (c *capturePSKConn) Write(p []byte) (int, error) { return c.Buffer.Write(p) }
++func (c *capturePSKConn) Read(p []byte) (int, error)  { return c.Buffer.Read(p) }

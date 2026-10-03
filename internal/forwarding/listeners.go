@@ -54,7 +54,7 @@ func inferProtocols(coreType string, inbound map[string]any) []Protocol {
 	}
 	if strings.EqualFold(coreType, "SING_BOX") {
 		switch kind {
-		case "anytls", "trojan", "vless", "http", "naive", "shadowtls":
+		case "snell", "anytls", "trojan", "vless", "http", "naive", "shadowtls":
 			return []Protocol{ProtocolTCP}
 		case "hysteria", "hysteria2", "tuic", "quic":
 			return []Protocol{ProtocolUDP}

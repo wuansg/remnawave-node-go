@@ -50,6 +50,8 @@ var (
 		"255.255.255.255": {},
 	}
 	singBoxKeyAliases = map[string]string{
+		"multiUserPsk":    "multi_user_psk",
+		"obfsMode":        "obfs_mode",
 		"certificatePath": "certificate_path",
 		"domainSuffix":    "domain_suffix",
 		"ipIsPrivate":     "ip_is_private",
@@ -142,6 +144,8 @@ type BulkAddUser struct {
 		VLESSUUID      string `json:"vlessUuid"`
 		TrojanPassword string `json:"trojanPassword"`
 		SSPassword     string `json:"ssPassword"`
+		AnyTLSPassword string `json:"anytlsPassword"`
+		SnellPSK       string `json:"snellPsk"`
 	} `json:"userData"`
 }
 
@@ -193,10 +197,6 @@ type GetResetRequest struct {
 
 type GetUserIPListRequest struct {
 	UserID string `json:"userId"`
-}
-
-type VisionIPRequest struct {
-	IP string `json:"ip"`
 }
 
 type PluginSyncRequest struct {
@@ -595,7 +595,6 @@ func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {
 	}
 
 	snapshot := system.SystemSnapshot(m.network)
-	pluginState := m.state.PluginState()
 	coreStats := map[string]any{
 		"numGoroutine": stats.NumGoroutine,
 		"numGC":        stats.NumGC,
@@ -611,11 +610,6 @@ func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {
 	return map[string]any{
 		"response": map[string]any{
 			"coreInfo": coreStats,
-			"plugins": map[string]any{
-				"torrentBlocker": map[string]any{
-					"reportsCount": len(pluginState.TorrentReports),
-				},
-			},
 			"system": map[string]any{
 				"stats": snapshot.Stats,
 			},
@@ -963,14 +957,6 @@ func (m *Manager) DropIPs(request DropIPsRequest) map[string]any {
 	return map[string]any{"response": map[string]any{"success": true}}
 }
 
-func (m *Manager) BlockIP(ctx context.Context, request VisionIPRequest) map[string]any {
-	return map[string]any{"response": map[string]any{"success": false, "error": "Vision routing is no longer supported"}}
-}
-
-func (m *Manager) UnblockIP(ctx context.Context, request VisionIPRequest) map[string]any {
-	return map[string]any{"response": map[string]any{"success": false, "error": "Vision routing is no longer supported"}}
-}
-
 func (m *Manager) SyncPlugin(ctx context.Context, request PluginSyncRequest) map[string]any {
 	m.coreMu.Lock()
 	defer m.coreMu.Unlock()
@@ -1001,7 +987,6 @@ func (m *Manager) SyncPlugin(ctx context.Context, request PluginSyncRequest) map
 		return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error()}}
 	}
 
-	changedTorrent := current.TorrentEnabled != next.TorrentEnabled || current.TorrentDuration != next.TorrentDuration || !sameStringSet(current.TorrentIncludeRuleTags, next.TorrentIncludeRuleTags)
 	if m.nftReady {
 		if err := m.applyPluginNFTState(ctx, next, current); err != nil {
 			now := time.Now().UTC()
@@ -1012,21 +997,6 @@ func (m *Manager) SyncPlugin(ctx context.Context, request PluginSyncRequest) map
 		}
 	}
 	m.state.SetPluginState(next)
-	if changedTorrent {
-		if err := m.restartCurrentCore(ctx); err != nil {
-			m.state.SetPluginState(current)
-			m.restorePluginNFTState(current)
-			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if rollbackErr := m.restartCurrentCore(rollbackCtx); rollbackErr != nil {
-				m.logger.Error("failed to restart core after plugin rollback", "error", rollbackErr)
-			}
-			current.LastAttemptAt = ptrTime(time.Now().UTC())
-			current.LastError = err.Error()
-			m.state.SetPluginState(current)
-			return map[string]any{"response": map[string]any{"accepted": false, "error": err.Error(), "rolledBack": true}}
-		}
-	}
 	now := time.Now().UTC()
 	next.AppliedAt = &now
 	next.LastAttemptAt = &now
@@ -1071,8 +1041,6 @@ func compilePluginState(ctx context.Context, request PluginSyncRequest, previous
 	if err := validateSharedListReferences(request.Plugin.Config, sharedLists); err != nil {
 		return next, err
 	}
-	configureConnectionDrop(&next, request.Plugin.Config, sharedLists)
-	configureTorrentBlocker(&next, request.Plugin.Config, sharedLists)
 	configureIngressFilter(&next, request.Plugin.Config, sharedLists)
 	configureEgressFilter(&next, request.Plugin.Config, sharedLists)
 	if err := resolveEgressDomains(ctx, &next, previous); err != nil {
@@ -1083,25 +1051,11 @@ func compilePluginState(ctx context.Context, request PluginSyncRequest, previous
 
 func pluginCompileSummary(plugin state.PluginState) map[string]any {
 	return map[string]any{
-		"connectionDropWhitelistIps": len(plugin.ConnectionDropWhitelist),
-		"ingressBlockedIps":          len(plugin.IngressBlocked),
-		"egressBlockedIps":           len(plugin.EgressBlockedIPs),
-		"egressBlockedDomains":       len(plugin.EgressBlockedDomains),
-		"egressBlockedPorts":         len(plugin.EgressBlockedPorts),
-		"torrentBlockerEnabled":      plugin.TorrentEnabled,
+		"ingressBlockedIps":    len(plugin.IngressBlocked),
+		"egressBlockedIps":     len(plugin.EgressBlockedIPs),
+		"egressBlockedDomains": len(plugin.EgressBlockedDomains),
+		"egressBlockedPorts":   len(plugin.EgressBlockedPorts),
 	}
-}
-
-func (m *Manager) CollectReports() map[string]any {
-	reports := m.state.FlushTorrentReports()
-	items := make([]map[string]any, 0, len(reports))
-	for _, report := range reports {
-		items = append(items, map[string]any{
-			"actionReport": report.ActionReport,
-			"coreReport":   report.CoreReport,
-		})
-	}
-	return map[string]any{"response": map[string]any{"reports": items}}
 }
 
 func (m *Manager) BlockIPs(ctx context.Context, request BlockIPsRequest) map[string]any {
@@ -1121,7 +1075,7 @@ func (m *Manager) UnblockIPs(ctx context.Context, request UnblockIPsRequest) map
 			if !valid {
 				return map[string]any{"response": map[string]any{"accepted": false}}
 			}
-			if err := m.nftDeleteElement(ctx, "torrent-blocker"+family, ip); err != nil {
+			if err := m.nftDeleteElement(ctx, "temporary-blocked-ip"+family, ip); err != nil {
 				return map[string]any{"response": map[string]any{"accepted": false}}
 			}
 			if err := m.nftDeleteElement(ctx, "ingress-filter-ip"+family, ip); err != nil {
@@ -1137,48 +1091,6 @@ func (m *Manager) RecreateTables(ctx context.Context) map[string]any {
 		return map[string]any{"response": map[string]any{"accepted": false}}
 	}
 	return map[string]any{"response": map[string]any{"accepted": true}}
-}
-
-func (m *Manager) HandleWebhook(ctx context.Context, body any) {
-	payload, ok := body.(map[string]any)
-	if !ok {
-		return
-	}
-
-	userID := stringValue(payload["email"])
-	source := stringValue(payload["source"])
-	ip := extractIP(source)
-	if userID != "" && ip != "" {
-		m.state.RecordUserIP(userID, ip, time.Now())
-	}
-
-	pluginState := m.state.PluginState()
-	if !pluginState.TorrentEnabled || ip == "" || userID == "" {
-		return
-	}
-	if isIgnoredIP(ip, pluginState.ConnectionDropWhitelist) || isIgnoredIP(ip, pluginState.TorrentIgnoredIPs) {
-		return
-	}
-	if _, ignored := pluginState.TorrentIgnoredUsers[userID]; ignored {
-		return
-	}
-
-	blocked := true
-	if err := m.blockIPWithTimeout(ctx, ip, pluginState.TorrentDuration); err != nil {
-		blocked = false
-	}
-	report := state.TorrentReport{
-		ActionReport: map[string]any{
-			"blocked":       blocked,
-			"ip":            ip,
-			"blockDuration": pluginState.TorrentDuration,
-			"willUnblockAt": time.Now().Add(time.Duration(pluginState.TorrentDuration) * time.Second),
-			"userId":        userID,
-			"processedAt":   time.Now(),
-		},
-		CoreReport: payload,
-	}
-	m.state.AddTorrentReport(report)
 }
 
 func (m *Manager) restartCurrentCore(ctx context.Context) error {
@@ -1660,6 +1572,15 @@ func (m *Manager) applyAddUsersRequest(request AddUsersRequest) error {
 			if inbound.Type == "hysteria" {
 				item.Password = user.UserData.VLESSUUID
 			}
+			if inbound.Type == "snell" {
+				item.Password = user.UserData.SnellPSK
+			}
+			if inbound.Type == "anytls" {
+				item.Password = user.UserData.AnyTLSPassword
+			}
+			if inbound.Type == "hysteria2" {
+				item.Password = user.UserData.VLESSUUID
+			}
 			if err := m.addUserToTag(item); err != nil {
 				return err
 			}
@@ -1703,8 +1624,8 @@ func (m *Manager) recreateNFTables(ctx context.Context) error {
 		return err
 	}
 	for _, cmd := range [][]string{
-		{"add", "set", "inet", nftTableName, "torrent-blocker", "{", "type", "ipv4_addr;", "flags", "timeout;", "}"},
-		{"add", "set", "inet", nftTableName, "torrent-blocker6", "{", "type", "ipv6_addr;", "flags", "timeout;", "}"},
+		{"add", "set", "inet", nftTableName, "temporary-blocked-ip", "{", "type", "ipv4_addr;", "flags", "timeout;", "}"},
+		{"add", "set", "inet", nftTableName, "temporary-blocked-ip6", "{", "type", "ipv6_addr;", "flags", "timeout;", "}"},
 		{"add", "set", "inet", nftTableName, "ingress-filter-ip", "{", "type", "ipv4_addr;", "flags", "interval;", "auto-merge;", "}"},
 		{"add", "set", "inet", nftTableName, "ingress-filter-ip6", "{", "type", "ipv6_addr;", "flags", "interval;", "auto-merge;", "}"},
 		{"add", "set", "inet", nftTableName, "egress-filter-ip", "{", "type", "ipv4_addr;", "flags", "interval;", "auto-merge;", "}"},
@@ -1713,9 +1634,9 @@ func (m *Manager) recreateNFTables(ctx context.Context) error {
 		{"add", "chain", "inet", nftTableName, "input", "{", "type", "filter", "hook", "input", "priority", "0;", "policy", "accept;", "}"},
 		{"add", "chain", "inet", nftTableName, "output", "{", "type", "filter", "hook", "output", "priority", "0;", "policy", "accept;", "}"},
 		{"add", "rule", "inet", nftTableName, "input", "ip", "saddr", "@ingress-filter-ip", "drop"},
-		{"add", "rule", "inet", nftTableName, "input", "ip", "saddr", "@torrent-blocker", "drop"},
+		{"add", "rule", "inet", nftTableName, "input", "ip", "saddr", "@temporary-blocked-ip", "drop"},
 		{"add", "rule", "inet", nftTableName, "input", "ip6", "saddr", "@ingress-filter-ip6", "drop"},
-		{"add", "rule", "inet", nftTableName, "input", "ip6", "saddr", "@torrent-blocker6", "drop"},
+		{"add", "rule", "inet", nftTableName, "input", "ip6", "saddr", "@temporary-blocked-ip6", "drop"},
 		{"add", "rule", "inet", nftTableName, "output", "ip", "daddr", "@egress-filter-ip", "drop"},
 		{"add", "rule", "inet", nftTableName, "output", "ip6", "daddr", "@egress-filter-ip6", "drop"},
 		{"add", "rule", "inet", nftTableName, "output", "tcp", "dport", "@egress-filter-port", "drop"},
@@ -1788,7 +1709,7 @@ func (m *Manager) blockIPWithTimeout(ctx context.Context, ip string, timeout int
 	}
 	m.state.SetBlockedIP(ip, until)
 	if m.nftReady {
-		args := []string{"add", "element", "inet", nftTableName, "torrent-blocker" + family, "{", ip}
+		args := []string{"add", "element", "inet", nftTableName, "temporary-blocked-ip" + family, "{", ip}
 		if timeout > 0 {
 			args = append(args, "timeout", fmt.Sprintf("%ds", timeout))
 		}
@@ -1966,6 +1887,11 @@ func addSingBoxUser(config map[string]any, item AddUserItem) error {
 		users := ensureSliceMap(inbound, "users")
 		user := map[string]any{"name": statname.UserInbound(item.Username, item.Tag)}
 		switch protocol {
+		case "snell":
+			if inbound["multi_user_psk"] != true || len(item.Password) < 16 || len(item.Password) > 255 {
+				return fmt.Errorf("snell requires multi_user_psk and a 16-255 byte user PSK")
+			}
+			user["psk"] = item.Password
 		case "anytls":
 			user["password"] = item.Password
 		case "hysteria2":
@@ -2035,13 +1961,9 @@ func validateSharedListReferences(config map[string]any, shared map[string]plugi
 		values   []any
 		expected string
 	}
-	torrent := ensureConfigMap(config["torrentBlocker"])
-	connectionDrop := ensureConfigMap(config["connectionDrop"])
 	ingress := ensureConfigMap(config["ingressFilter"])
 	egress := ensureConfigMap(config["egressFilter"])
 	fields := []referenceField{
-		{values: asAnySlice(ensureConfigMap(torrent["ignoreLists"])["ip"]), expected: "ipList"},
-		{values: asAnySlice(connectionDrop["whitelistIps"]), expected: "ipList"},
 		{values: asAnySlice(ingress["blockedIps"]), expected: "ipList"},
 		{values: asAnySlice(egress["blockedIps"]), expected: "ipList"},
 		{values: asAnySlice(egress["blockedDomains"]), expected: "domainList"},
@@ -2063,27 +1985,6 @@ func validateSharedListReferences(config map[string]any, shared map[string]plugi
 		}
 	}
 	return nil
-}
-
-func configureConnectionDrop(target *state.PluginState, config map[string]any, shared map[string]pluginSharedList) {
-	plugin := ensureConfigMap(config["connectionDrop"])
-	if !boolValue(plugin["enabled"]) {
-		return
-	}
-	target.ConnectionDropWhitelist = sliceToSet(resolveIPList(stringSlice(plugin["whitelistIps"]), shared))
-}
-
-func configureTorrentBlocker(target *state.PluginState, config map[string]any, shared map[string]pluginSharedList) {
-	plugin := ensureConfigMap(config["torrentBlocker"])
-	if !boolValue(plugin["enabled"]) {
-		return
-	}
-	target.TorrentEnabled = true
-	target.TorrentDuration = intValue(plugin["blockDuration"])
-	ignoreLists := ensureConfigMap(plugin["ignoreLists"])
-	target.TorrentIgnoredIPs = sliceToSet(resolveIPList(stringSlice(ignoreLists["ip"]), shared))
-	target.TorrentIgnoredUsers = sliceToSet(numberStrings(ignoreLists["userId"]))
-	target.TorrentIncludeRuleTags = sliceToSet(stringSlice(plugin["includeRuleTags"]))
 }
 
 func configureIngressFilter(target *state.PluginState, config map[string]any, shared map[string]pluginSharedList) {
@@ -2148,11 +2049,7 @@ func resolveEgressDomains(ctx context.Context, target *state.PluginState, previo
 
 func emptyPluginState() state.PluginState {
 	return state.PluginState{
-		DomainResolutions:       map[string]state.DomainResolution{},
-		ConnectionDropWhitelist: map[string]struct{}{},
-		TorrentIgnoredIPs:       map[string]struct{}{},
-		TorrentIgnoredUsers:     map[string]struct{}{},
-		TorrentIncludeRuleTags:  map[string]struct{}{},
+		DomainResolutions: map[string]state.DomainResolution{},
 	}
 }
 
@@ -2315,34 +2212,6 @@ func hasNetAdmin() bool {
 	return false
 }
 
-func extractIP(source string) string {
-	if source == "" {
-		return ""
-	}
-	value := strings.TrimPrefix(source, "tcp:")
-	value = strings.TrimPrefix(value, "udp:")
-	value = strings.Trim(value, "[]")
-	if host, _, err := net.SplitHostPort(value); err == nil {
-		value = host
-	}
-	if ip := net.ParseIP(value); ip != nil {
-		return ip.String()
-	}
-	return ""
-}
-
-func sameStringSet(left, right map[string]struct{}) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for key := range left {
-		if _, ok := right[key]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
 func isIgnoredIP(ip string, extra map[string]struct{}) bool {
 	if _, ok := defaultIgnoredIPs[ip]; ok {
 		return true
@@ -2384,31 +2253,6 @@ func intValue(value any) int {
 	}
 }
 
-func intSlice(value any) []int {
-	items := asAnySlice(value)
-	out := make([]int, 0, len(items))
-	for _, item := range items {
-		out = append(out, intValue(item))
-	}
-	return out
-}
-
-func numberStrings(value any) []string {
-	items := asAnySlice(value)
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		switch typed := item.(type) {
-		case float64:
-			out = append(out, strconv.Itoa(int(typed)))
-		case int:
-			out = append(out, strconv.Itoa(typed))
-		case string:
-			out = append(out, typed)
-		}
-	}
-	return out
-}
-
 func stringSlice(value any) []string {
 	switch typed := value.(type) {
 	case []string:
@@ -2428,14 +2272,6 @@ func stringSlice(value any) []string {
 
 func valueStrings(value any) []string {
 	return stringSlice(value)
-}
-
-func sliceToSet(values []string) map[string]struct{} {
-	out := make(map[string]struct{}, len(values))
-	for _, value := range values {
-		out[value] = struct{}{}
-	}
-	return out
 }
 
 func asAnySlice(value any) []any {

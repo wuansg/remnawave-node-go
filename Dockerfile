@@ -1,6 +1,6 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
-ARG REMNAWAVE_NODE_VERSION=3.13.0
+ARG REMNAWAVE_NODE_VERSION=3.14.0
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -24,6 +24,8 @@ COPY third_party/sing-box-patches /patches
 RUN apk add --no-cache git patch \
     && git clone --depth 1 --branch v${SING_BOX_VERSION} https://github.com/SagerNet/sing-box.git . \
     && patch -p1 < /patches/0001-expose-user-in-clash-connections.patch \
+    && patch -p1 < /patches/0002-snell-multi-psk.patch \
+    && CGO_ENABLED=0 go test ./protocol/snell ./option \
     && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
         go build \
         -tags "with_v2ray_api,with_clash_api,with_quic" \
@@ -49,7 +51,7 @@ RUN apk add --no-cache curl \
 
 FROM alpine:3.22
 
-ARG REMNAWAVE_NODE_VERSION=3.13.0
+ARG REMNAWAVE_NODE_VERSION=3.14.0
 ARG SING_BOX_VERSION=1.14.0
 
 LABEL org.opencontainers.image.title="Remnawave Node Go"

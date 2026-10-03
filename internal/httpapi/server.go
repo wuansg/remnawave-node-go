@@ -400,9 +400,6 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, s.manager.CompilePlugin(r.Context(), body))
 	}))
-	mux.HandleFunc("POST /node/plugin/torrent-blocker/collect", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.manager.CollectReports())
-	}))
 	mux.HandleFunc("POST /node/plugin/nftables/block-ips", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.BlockIPsRequest
 		if !decodeJSON(w, r, &body) {
@@ -421,20 +418,6 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, s.manager.RecreateTables(r.Context()))
 	}))
 
-	mux.HandleFunc("POST /vision/block-ip", func(w http.ResponseWriter, r *http.Request) {
-		var body nodeapp.VisionIPRequest
-		if !decodeJSON(w, r, &body) {
-			return
-		}
-		writeJSON(w, http.StatusOK, s.manager.BlockIP(r.Context(), body))
-	})
-	mux.HandleFunc("POST /vision/unblock-ip", func(w http.ResponseWriter, r *http.Request) {
-		var body nodeapp.VisionIPRequest
-		if !decodeJSON(w, r, &body) {
-			return
-		}
-		writeJSON(w, http.StatusOK, s.manager.UnblockIP(r.Context(), body))
-	})
 }
 
 func writeForwardingError(w http.ResponseWriter, err error) {
@@ -460,13 +443,6 @@ func (s *Server) rejectLegacyReset(w http.ResponseWriter) bool {
 func (s *Server) registerInternal(mux *http.ServeMux) {
 	mux.HandleFunc("GET /internal/get-config", s.requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.manager.InternalConfig())
-	}))
-	mux.HandleFunc("POST /internal/webhook", s.requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
-		var body any
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
-			s.manager.HandleWebhook(r.Context(), body)
-		}
-		w.WriteHeader(http.StatusOK)
 	}))
 }
 
