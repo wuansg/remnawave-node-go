@@ -20,6 +20,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/remnawave/remnawave-node-go/internal/auth"
+	"github.com/remnawave/remnawave-node-go/internal/benchmark"
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	"github.com/remnawave/remnawave-node-go/internal/forwarding"
 	"github.com/remnawave/remnawave-node-go/internal/geocheck"
@@ -32,10 +33,11 @@ const maxRequestBodySize = int64(1 << 30)
 var ErrServerClosed = http.ErrServerClosed
 
 type Server struct {
-	cfg      config.Config
-	logger   *slog.Logger
-	verifier *auth.Verifier
-	manager  *nodeapp.Manager
+	cfg        config.Config
+	logger     *slog.Logger
+	verifier   *auth.Verifier
+	manager    *nodeapp.Manager
+	benchmarks *benchmark.Runner
 
 	public   *http.Server
 	internal *http.Server
@@ -85,6 +87,14 @@ func NewServer(cfg config.Config, manager *nodeapp.Manager, logger *slog.Logger)
 		verifier: verifier,
 		manager:  manager,
 	}
+	benchmarkDir := os.Getenv("BENCHMARK_STATE_PATH")
+	if benchmarkDir == "" {
+		benchmarkDir = "/var/lib/remnanode/benchmarks"
+	}
+	srv.benchmarks, err = benchmark.New(benchmarkDir)
+	if err != nil {
+		return nil, fmt.Errorf("initialize benchmarks: %w", err)
+	}
 
 	publicMux := http.NewServeMux()
 	srv.registerPublic(publicMux)
@@ -125,6 +135,9 @@ func (s *Server) ListenAndServeInternal() error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.benchmarks != nil {
+		s.benchmarks.Close()
+	}
 	_ = s.public.Shutdown(ctx)
 	_ = s.internal.Shutdown(ctx)
 	if s.cfg.InternalSocketPath != "" {
@@ -134,6 +147,40 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) registerPublic(mux *http.ServeMux) {
+	mux.HandleFunc("POST /node/benchmarks/start", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		var body benchmark.Request
+		r.Body = http.MaxBytesReader(w, r.Body, 32*1024)
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		job, err := s.benchmarks.Start(body)
+		if err != nil {
+			status := http.StatusUnprocessableEntity
+			if errors.Is(err, benchmark.ErrBusy) {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, map[string]any{"message": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": job})
+	}))
+	mux.HandleFunc("POST /node/benchmarks/cancel", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID string `json:"id"`
+		}
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": map[string]any{"cancelled": s.benchmarks.Cancel(body.ID)}})
+	}))
+	mux.HandleFunc("GET /node/benchmarks/{id}", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		job, ok := s.benchmarks.Get(r.PathValue("id"))
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]any{"message": "Benchmark not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"response": job})
+	}))
 	startCore := s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body nodeapp.StartRequest
 		if !decodeJSON(w, r, &body) {

@@ -1,6 +1,6 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
-ARG REMNAWAVE_NODE_VERSION=3.14.0
+ARG REMNAWAVE_NODE_VERSION=3.15.0
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -51,7 +51,7 @@ RUN apk add --no-cache curl \
 
 FROM alpine:3.22
 
-ARG REMNAWAVE_NODE_VERSION=3.14.0
+ARG REMNAWAVE_NODE_VERSION=3.15.0
 ARG SING_BOX_VERSION=1.14.0
 
 LABEL org.opencontainers.image.title="Remnawave Node Go"
@@ -64,7 +64,8 @@ LABEL org.opencontainers.image.documentation="https://docs.rw"
 LABEL org.opencontainers.image.version="${REMNAWAVE_NODE_VERSION}"
 LABEL org.opencontainers.image.sing-box.version="${SING_BOX_VERSION}"
 
-RUN apk add --no-cache supervisor curl ca-certificates iproute2 nftables \
+RUN apk add --no-cache supervisor curl ca-certificates iproute2 nftables fio sysbench coreutils \
+	&& sysbench --version && fio --version \
 	&& mkdir -p /var/log/supervisor /run/remnawave /var/lib/remnanode
 
 COPY --from=go-build /out/remnawave-node-go /usr/local/bin/remnawave-node-go
@@ -94,6 +95,7 @@ ENV SING_BOX_BINARY_PATH=/usr/local/bin/sing-box
 ENV SING_BOX_LAST_GOOD_CONFIG_PATH=/var/lib/remnanode/sing-box.last-good.json
 ENV USAGE_SNAPSHOT_DB_PATH=/var/lib/remnanode/stats.db
 ENV FORWARDING_STATE_PATH=/var/lib/remnanode/forwarding.json
+ENV BENCHMARK_STATE_PATH=/var/lib/remnanode/benchmarks
 ENV NODE_API_SNI_ENABLED=false
 
 VOLUME ["/var/lib/remnanode"]

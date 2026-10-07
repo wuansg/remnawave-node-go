@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"github.com/remnawave/remnawave-node-go/internal/benchmark"
 	"time"
 
 	"github.com/remnawave/remnawave-node-go/internal/forwarding"
@@ -65,7 +66,7 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		State:      "unsupported",
 		DNSResults: map[string]string{},
 	}
-	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, PluginCompileCapability, PluginDNSStatusCapability, NetworkInventoryCapability, NodeAPISNICapability, "geocheck_v1"}
+	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, PluginCompileCapability, PluginDNSStatusCapability, NetworkInventoryCapability, NodeAPISNICapability, "geocheck_v1", benchmark.Capability}
 	if m.cfg.NodeAPISNIEnabled {
 		capabilities = append(capabilities, NodeAPISNIEnforcedCapability)
 	}

@@ -13,7 +13,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  REMNAWAVE_NODE_VERSION: 3.14.0
+  REMNAWAVE_NODE_VERSION: 3.15.0
   SING_BOX_VERSION: 1.14.0
 
 jobs:
@@ -32,6 +32,13 @@ jobs:
 
       - name: Unit and race tests
         run: go test -race ./...
+
+      - name: Test bounded hardware tools in the runtime distribution
+        run: |
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/benchmark.test" ./internal/benchmark
+          docker run --rm -e BENCHMARK_HARDWARE_TEST=1 \
+            -v "$RUNNER_TEMP/benchmark.test:/benchmark.test:ro" alpine:3.22 \
+            sh -c 'apk add --no-cache fio sysbench coreutils && /benchmark.test -test.v -test.run TestHardwareTools'
 
       - name: Test patched Snell core and user traffic accounting
         run: |
