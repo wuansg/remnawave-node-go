@@ -1,9 +1,6 @@
-name: Publish Docker Image
+name: One-off Oracle ARM64 3.16.0
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -68,6 +65,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Set up QEMU for this one-off ARM64 release
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -84,14 +86,13 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ env.REMNAWAVE_NODE_VERSION }},priority=1000
-            type=raw,value=main,enable={{is_default_branch}},priority=200
-            type=raw,value=latest,enable={{is_default_branch}},priority=100
-            type=sha,format=short,priority=50
+            type=raw,value=${{ env.REMNAWAVE_NODE_VERSION }}-arm64,priority=1000
+          labels: |
+            org.opencontainers.image.version=${{ env.REMNAWAVE_NODE_VERSION }}
 
       - name: Reject an existing immutable version tag
         run: |
-          if docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REMNAWAVE_NODE_VERSION }}" >/dev/null 2>&1; then
+          if docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REMNAWAVE_NODE_VERSION }}-arm64" >/dev/null 2>&1; then
             echo "Version tag ${{ env.REMNAWAVE_NODE_VERSION }} already exists; bump the Agent version before publishing."
             exit 1
           fi
@@ -101,7 +102,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          platforms: linux/arm64
           push: true
           provenance: mode=max
           sbom: true
