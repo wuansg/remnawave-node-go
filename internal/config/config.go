@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const defaultVersion = "3.15.0"
+const defaultVersion = "3.16.0"
 
 var buildVersion = defaultVersion
 
@@ -23,6 +23,8 @@ type Config struct {
 	DisableHashCheck      bool
 	SingBoxAPIPort        int
 	SingBoxV2RayAPIPort   int
+	SingBoxAuditAPIPort   int
+	AccessAuditDBPath     string
 	InternalRESTToken     string
 	InternalSocketPath    string
 	SupervisordSocket     string
@@ -65,6 +67,8 @@ func Load() (Config, error) {
 		DisableHashCheck:      envBool("DISABLE_HASHED_SET_CHECK", false),
 		SingBoxAPIPort:        envInt("SING_BOX_API_PORT", 61001),
 		SingBoxV2RayAPIPort:   envInt("SING_BOX_V2RAY_API_PORT", 61002),
+		SingBoxAuditAPIPort:   envInt("SING_BOX_AUDIT_API_PORT", 61003),
+		AccessAuditDBPath:     envString("ACCESS_AUDIT_DB_PATH", "/var/lib/remnanode/access-audit.db"),
 		InternalRESTToken:     os.Getenv("INTERNAL_REST_TOKEN"),
 		InternalSocketPath:    envString("INTERNAL_SOCKET_PATH", "/run/remnawave/internal.sock"),
 		SupervisordSocket:     os.Getenv("SUPERVISORD_SOCKET_PATH"),

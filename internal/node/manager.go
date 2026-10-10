@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/remnawave/remnawave-node-go/internal/accessaudit"
 	"github.com/remnawave/remnawave-node-go/internal/config"
 	"github.com/remnawave/remnawave-node-go/internal/coreapi"
 	"github.com/remnawave/remnawave-node-go/internal/forwarding"
@@ -71,6 +72,7 @@ type Manager struct {
 	coreMu             sync.Mutex
 	singStats          coreapi.StatsClient
 	usageSnapshots     *usagesnapshot.Store
+	accessAudit        *accessaudit.Collector
 	forwarding         *forwarding.Service
 	geocheck           *geocheck.Runner
 	usageMu            sync.Mutex
@@ -248,7 +250,22 @@ func NewManager(cfg config.Config, runtimeState *state.Runtime, logger *slog.Log
 	if err := manager.forwarding.Restore(context.Background()); err != nil {
 		logger.Error("failed to restore forwarding rules", "error", err)
 	}
+	if cfg.AccessAuditDBPath != "" && cfg.SingBoxAuditAPIPort > 0 {
+		store, err := accessaudit.Open(cfg.AccessAuditDBPath, 32<<20)
+		if err != nil {
+			logger.Error("access audit unavailable; proxy and usage statistics are unaffected", "error", err)
+		} else {
+			manager.accessAudit = accessaudit.Start(store, fmt.Sprintf("127.0.0.1:%d", cfg.SingBoxAuditAPIPort), auditAPISecret(cfg))
+		}
+	}
 	return manager, nil
+}
+
+func (m *Manager) AccessAudit() *accessaudit.Store {
+	if m.accessAudit == nil {
+		return nil
+	}
+	return m.accessAudit.Store
 }
 
 func (m *Manager) Geocheck(ctx context.Context, request geocheck.Request) (map[string]any, error) {
@@ -257,6 +274,9 @@ func (m *Manager) Geocheck(ctx context.Context, request geocheck.Request) (map[s
 
 func (m *Manager) Close() error {
 	var first error
+	if m.accessAudit != nil {
+		first = m.accessAudit.Close()
+	}
 	if m.singStats != nil {
 		if err := m.singStats.Close(); first == nil {
 			first = err
@@ -1850,7 +1870,26 @@ func applySingBoxAPIConfig(config map[string]any, cfg config.Config) map[string]
 	}
 	experimental["clash_api"] = clashAPI
 	config["experimental"] = experimental
+	if cfg.SingBoxAuditAPIPort > 0 {
+		services := asMapSlice(config["services"])
+		filtered := services[:0]
+		for _, service := range services {
+			if stringValue(service["tag"]) != "remnawave-access-audit" {
+				filtered = append(filtered, service)
+			}
+		}
+		filtered = append(filtered, map[string]any{"type": "api", "tag": "remnawave-access-audit", "listen": "127.0.0.1", "listen_port": cfg.SingBoxAuditAPIPort, "secret": auditAPISecret(cfg), "access_control_allow_origin": []any{"http://127.0.0.1"}})
+		config["services"] = toAnySlice(filtered)
+	}
 	return config
+}
+
+func auditAPISecret(cfg config.Config) string {
+	if cfg.InternalRESTToken != "" {
+		return cfg.InternalRESTToken
+	}
+	digest := sha256.Sum256([]byte("remnawave-access-audit:" + cfg.SecretKey))
+	return hex.EncodeToString(digest[:])
 }
 
 func encodeSingBoxConfigUsers(config map[string]any) {

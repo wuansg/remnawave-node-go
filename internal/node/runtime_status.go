@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"github.com/remnawave/remnawave-node-go/internal/accessaudit"
 	"github.com/remnawave/remnawave-node-go/internal/benchmark"
 	"time"
 
@@ -67,6 +68,9 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		DNSResults: map[string]string{},
 	}
 	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, PluginCompileCapability, PluginDNSStatusCapability, NetworkInventoryCapability, NodeAPISNICapability, "geocheck_v1", benchmark.Capability}
+	if m.accessAudit != nil {
+		capabilities = append(capabilities, accessaudit.Capability)
+	}
 	if m.cfg.NodeAPISNIEnabled {
 		capabilities = append(capabilities, NodeAPISNIEnforcedCapability)
 	}

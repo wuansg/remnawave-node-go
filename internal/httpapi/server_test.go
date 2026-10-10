@@ -63,6 +63,24 @@ func TestRemovedCorePluginEndpoints(t *testing.T) {
 	}
 }
 
+func TestAccessAuditEndpointsRequireAuthentication(t *testing.T) {
+	s := &Server{}
+	mux := http.NewServeMux()
+	s.registerPublic(mux)
+	for _, request := range []struct{ method, path string }{
+		{http.MethodPost, "/node/access-audit/config"},
+		{http.MethodPost, "/node/access-audit/pull"},
+		{http.MethodPost, "/node/access-audit/ack"},
+		{http.MethodGet, "/node/access-audit/status"},
+	} {
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequest(request.method, request.path, nil))
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: expected 401, got %d", request.path, response.Code)
+		}
+	}
+}
+
 func TestBenchmarkEndpointsRequireAuthentication(t *testing.T) {
 	s := &Server{}
 	mux := http.NewServeMux()

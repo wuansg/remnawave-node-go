@@ -147,6 +147,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) registerPublic(mux *http.ServeMux) {
+	s.registerAccessAudit(mux)
 	mux.HandleFunc("POST /node/benchmarks/start", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body benchmark.Request
 		r.Body = http.MaxBytesReader(w, r.Body, 32*1024)
