@@ -476,6 +476,9 @@ func (m *Manager) UsageSnapshotActive() bool {
 }
 
 func (m *Manager) ActivateUsageSnapshots(ctx context.Context) (usagesnapshot.Status, error) {
+	m.coreMu.Lock()
+	defer m.coreMu.Unlock()
+
 	if m.usageSnapshots == nil {
 		return usagesnapshot.Status{}, errors.New("usage snapshot storage is unavailable")
 	}
@@ -488,11 +491,19 @@ func (m *Manager) ActivateUsageSnapshots(ctx context.Context) (usagesnapshot.Sta
 }
 
 func (m *Manager) CaptureUsageSnapshot(ctx context.Context) {
+	// Serialize the whole read -> baseline commit, not only the reset flag.
+	// Forwarding seals already hold coreMu. Otherwise their older RPC sample
+	// can commit after a newer periodic sample and look like a counter reset.
+	// The same lock also fences activation and actual core lifecycle changes.
+	m.coreMu.Lock()
+	defer m.coreMu.Unlock()
+
 	if err := m.captureUsageSnapshot(ctx); err != nil {
 		m.logger.Warn("failed to capture usage snapshot", "error", err)
 	}
 }
 
+// captureUsageSnapshot requires coreMu to be held by the caller.
 func (m *Manager) captureUsageSnapshot(ctx context.Context) error {
 	if !m.UsageSnapshotActive() {
 		return nil
