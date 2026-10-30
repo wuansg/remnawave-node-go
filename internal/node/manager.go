@@ -96,6 +96,9 @@ const (
 	defaultSingBoxHealthPollInterval = 250 * time.Millisecond
 )
 
+// usageCaptureTimeout bounds counter sampling while coreMu is held.
+var usageCaptureTimeout = 5 * time.Second
+
 type StartRequest struct {
 	CoreType      string         `json:"coreType"`
 	Internals     startInternals `json:"internals"`
@@ -482,9 +485,16 @@ func (m *Manager) ActivateUsageSnapshots(ctx context.Context) (usagesnapshot.Sta
 	if m.usageSnapshots == nil {
 		return usagesnapshot.Status{}, errors.New("usage snapshot storage is unavailable")
 	}
-	counters, _, err := m.currentUsageCounters(ctx)
+	queryCtx, cancel := context.WithTimeout(ctx, usageCaptureTimeout)
+	defer cancel()
+	counters, _, coreComplete, err := m.currentUsageCounters(queryCtx)
 	if err != nil {
 		return usagesnapshot.Status{}, err
+	}
+	// A baseline without core counters would make the first capture replay
+	// the core's lifetime totals as fresh traffic.
+	if !coreComplete {
+		return usagesnapshot.Status{}, ErrCoreUnavailable
 	}
 	status, err := m.usageSnapshots.Activate(counters)
 	return m.withUsageSnapshotRuntime(status), err
@@ -508,17 +518,27 @@ func (m *Manager) captureUsageSnapshot(ctx context.Context) error {
 	if !m.UsageSnapshotActive() {
 		return nil
 	}
-	counters, capturing, err := m.currentUsageCounters(ctx)
+	// coreMu is held for the whole capture, so a hung sing-box stats RPC must
+	// not be able to block Start, restarts and forwarding syncs indefinitely.
+	queryCtx, cancel := context.WithTimeout(ctx, usageCaptureTimeout)
+	defer cancel()
+	counters, capturing, coreComplete, err := m.currentUsageCounters(queryCtx)
 	if err != nil {
 		return err
 	}
 	if !capturing {
 		return nil
 	}
-	m.usageMu.Lock()
-	coreRestarted := m.usageCoreRestarted
-	m.usageCoreRestarted = false
-	m.usageMu.Unlock()
+	// Only consume the restart marker when every core counter was sampled.
+	// Otherwise the next complete sample still needs it to treat the post
+	// restart values as fresh traffic instead of a delta from the old baseline.
+	coreRestarted := false
+	if coreComplete {
+		m.usageMu.Lock()
+		coreRestarted = m.usageCoreRestarted
+		m.usageCoreRestarted = false
+		m.usageMu.Unlock()
+	}
 	core := string(m.state.RunningCoreType())
 	if core == "" {
 		core = "FORWARDING_ONLY"
@@ -571,7 +591,10 @@ func (m *Manager) withUsageSnapshotRuntime(status usagesnapshot.Status) usagesna
 	return status
 }
 
-func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Counter, bool, error) {
+// currentUsageCounters returns coreComplete=false when a core stats query
+// failed. Core counters are then omitted entirely so their baselines stay
+// untouched until a later sample can read all of them consistently.
+func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Counter, bool, bool, error) {
 	result := make([]usagesnapshot.Counter, 0)
 	forwardingCounters := []forwarding.UsageCounter{}
 	forwardingActive := false
@@ -579,7 +602,7 @@ func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Cou
 		var err error
 		forwardingCounters, forwardingActive, err = m.forwarding.UsageCounters(ctx)
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 	}
 	for _, counter := range forwardingCounters {
@@ -591,23 +614,39 @@ func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Cou
 
 	client := m.statsClient()
 	if client == nil || m.state.RunningCoreType() == "" {
-		return result, forwardingActive, nil
+		return result, forwardingActive, true, nil
 	}
-	users := m.queryUserInboundStats(ctx, false)
+	coreCounters, err := m.currentCoreUsageCounters(ctx)
+	if err != nil {
+		m.logger.Warn("skipping core usage counters for this snapshot", "error", err)
+		return result, true, false, nil
+	}
+	return append(result, coreCounters...), true, true, nil
+}
+
+func (m *Manager) currentCoreUsageCounters(ctx context.Context) ([]usagesnapshot.Counter, error) {
+	result := make([]usagesnapshot.Counter, 0)
+	users, err := m.fetchUserInboundStats(ctx, false)
+	if err != nil {
+		return nil, err
+	}
 	for _, item := range users {
 		for _, direction := range []string{"uplink", "downlink"} {
 			result = append(result, usagesnapshot.Counter{Kind: "user", Name: item["username"].(string), Inbound: item["inbound"].(string), Direction: direction, Value: item[direction].(int64)})
 		}
 	}
 	for _, kind := range []string{"inbound", "outbound"} {
-		items := m.queryGroupedStats(ctx, kind, kind+">>>", false)
+		items, err := m.fetchGroupedStats(ctx, kind, kind+">>>", false)
+		if err != nil {
+			return nil, err
+		}
 		for _, item := range items {
 			for _, direction := range []string{"uplink", "downlink"} {
 				result = append(result, usagesnapshot.Counter{Kind: kind, Name: item[kind].(string), Direction: direction, Value: item[direction].(int64)})
 			}
 		}
 	}
-	return result, true, nil
+	return result, nil
 }
 
 func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {
@@ -724,14 +763,22 @@ func (m *Manager) statsClient() coreapi.StatsClient {
 }
 
 func (m *Manager) queryGroupedStats(ctx context.Context, kind, pattern string, reset bool) []map[string]any {
-	client := m.statsClient()
-	if client == nil {
-		return []map[string]any{}
-	}
-	stats, err := client.Query(ctx, pattern, reset)
+	items, err := m.fetchGroupedStats(ctx, kind, pattern, reset)
 	if err != nil {
 		m.logger.Warn("failed to query core traffic stats", "pattern", pattern, "error", err)
 		return []map[string]any{}
+	}
+	return items
+}
+
+func (m *Manager) fetchGroupedStats(ctx context.Context, kind, pattern string, reset bool) ([]map[string]any, error) {
+	client := m.statsClient()
+	if client == nil {
+		return []map[string]any{}, nil
+	}
+	stats, err := client.Query(ctx, pattern, reset)
+	if err != nil {
+		return nil, err
 	}
 	grouped := map[string]map[string]any{}
 	prefix := kind + ">>>"
@@ -769,19 +816,27 @@ func (m *Manager) queryGroupedStats(ctx context.Context, kind, pattern string, r
 		key = "username"
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i][key].(string) < items[j][key].(string) })
-	return items
+	return items, nil
 }
 
 func (m *Manager) queryUserInboundStats(ctx context.Context, reset bool) []map[string]any {
+	items, err := m.fetchUserInboundStats(ctx, reset)
+	if err != nil {
+		m.logger.Warn("failed to query core user traffic stats", "error", err)
+		return []map[string]any{}
+	}
+	return items
+}
+
+func (m *Manager) fetchUserInboundStats(ctx context.Context, reset bool) ([]map[string]any, error) {
 	client := m.statsClient()
 	if client == nil {
-		return []map[string]any{}
+		return []map[string]any{}, nil
 	}
 
 	stats, err := client.Query(ctx, "user>>>", reset)
 	if err != nil {
-		m.logger.Warn("failed to query core user traffic stats", "error", err)
-		return []map[string]any{}
+		return nil, err
 	}
 
 	grouped := map[string]map[string]any{}
@@ -836,7 +891,7 @@ func (m *Manager) queryUserInboundStats(ctx context.Context, reset bool) []map[s
 		return items[i]["inbound"].(string) < items[j]["inbound"].(string)
 	})
 
-	return items
+	return items, nil
 }
 
 func findTagStats(items []map[string]any, kind, tag string) map[string]any {
