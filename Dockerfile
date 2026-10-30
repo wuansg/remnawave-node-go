@@ -1,6 +1,6 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-build
 
-ARG REMNAWAVE_NODE_VERSION=3.16.1
+ARG REMNAWAVE_NODE_VERSION=3.16.2
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -51,7 +51,7 @@ RUN apk add --no-cache curl \
 
 FROM alpine:3.22
 
-ARG REMNAWAVE_NODE_VERSION=3.16.1
+ARG REMNAWAVE_NODE_VERSION=3.16.2
 ARG SING_BOX_VERSION=1.14.0
 
 LABEL org.opencontainers.image.title="Remnawave Node Go"
