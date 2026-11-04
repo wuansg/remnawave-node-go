@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,13 +104,45 @@ func TestSnellIntegration(t *testing.T) {
 		}, config.Config{SingBoxAPIPort: clashPort, SingBoxV2RayAPIPort: statsPort})
 	}
 	stopServer := start("server", serverConfig(users), snellPort)
+	// The first client reuses Snell connections (as subscriptions enable it) and
+	// dials through a relay that counts TCP connections reaching the server.
+	relay, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = relay.Close() })
+	var relayConns atomic.Int64
+	go func() {
+		for {
+			conn, err := relay.Accept()
+			if err != nil {
+				return
+			}
+			relayConns.Add(1)
+			go func() {
+				defer conn.Close()
+				upstream, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(snellPort)))
+				if err != nil {
+					return
+				}
+				defer upstream.Close()
+				go func() { _, _ = io.Copy(upstream, conn); _ = upstream.Close() }()
+				_, _ = io.Copy(conn, upstream)
+			}()
+		}
+	}()
 	proxies := make([]*http.Client, 2)
 	for i, user := range users {
 		socksPort := port()
+		outbound := map[string]any{"type": "snell", "server": "127.0.0.1", "server_port": snellPort, "version": 4, "psk": user.(map[string]any)["psk"]}
+		if i == 0 {
+			outbound["server_port"] = relay.Addr().(*net.TCPAddr).Port
+			outbound["reuse"] = true
+		}
 		start(fmt.Sprintf("client-%d", i), map[string]any{
 			"log":       map[string]any{"level": "error"},
 			"inbounds":  []any{map[string]any{"type": "socks", "listen": "127.0.0.1", "listen_port": socksPort}},
-			"outbounds": []any{map[string]any{"type": "snell", "server": "127.0.0.1", "server_port": snellPort, "version": 4, "psk": user.(map[string]any)["psk"]}},
+			"outbounds": []any{outbound},
 		}, socksPort)
 		dialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), nil, &net.Dialer{Timeout: time.Second})
 		if err != nil {
@@ -139,7 +172,7 @@ func TestSnellIntegration(t *testing.T) {
 		start("mihomo", map[string]any{
 			"mixed-port": socksPort, "allow-lan": false, "bind-address": "127.0.0.1",
 			"mode": "rule", "log-level": "debug", "external-controller": "",
-			"proxies": []any{map[string]any{"name": "snell", "type": "snell", "server": "127.0.0.1", "port": snellPort, "version": 5, "psk": "integration-user-one-12345", "udp": true}},
+			"proxies": []any{map[string]any{"name": "snell", "type": "snell", "server": "127.0.0.1", "port": snellPort, "version": 5, "psk": "integration-user-one-12345", "udp": true, "reuse": true}},
 			"rules":   []string{"MATCH,snell"},
 		}, socksPort)
 		proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", socksPort))
@@ -170,6 +203,16 @@ func TestSnellIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	opened := relayConns.Load()
+	for i := 0; i < 10; i++ {
+		if err := request(proxies[0]); err != nil {
+			t.Fatalf("reused Snell connection %d: %v", i, err)
+		}
+	}
+	if opened = relayConns.Load() - opened; opened >= 10 {
+		t.Fatalf("Snell reuse opened %d connections for 10 sequential requests", opened)
+	}
+	t.Logf("Snell reuse: 10 sequential requests used %d new connections", opened)
 	stats, err := coreapi.NewSingBoxStatsClient(fmt.Sprintf("127.0.0.1:%d", statsPort), insecure.NewCredentials())
 	if err != nil {
 		t.Fatal(err)
@@ -196,8 +239,17 @@ func TestSnellIntegration(t *testing.T) {
 	if err := request(proxies[1]); err == nil {
 		t.Fatal("removed user still connects")
 	}
-	if err := request(proxies[0]); err != nil {
-		t.Fatalf("remaining user broken: %v", err)
+	// Core restarts (how user changes apply) kill pooled Snell connections and
+	// clients do not retry a stale one: allow those requests to fail, but the
+	// next one must dial a fresh connection.
+	var restartErr error
+	for i := 0; i < 3; i++ {
+		if restartErr = request(proxies[0]); restartErr == nil {
+			break
+		}
+	}
+	if restartErr != nil {
+		t.Fatalf("remaining user broken: %v", restartErr)
 	}
 	stopServer()
 	start("empty-server", serverConfig([]any{}), snellPort)
