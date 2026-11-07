@@ -5,13 +5,16 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/remnawave/remnawave-node-go/internal/config"
 	"github.com/remnawave/remnawave-node-go/internal/coreapi"
 	"github.com/remnawave/remnawave-node-go/internal/state"
 	"github.com/remnawave/remnawave-node-go/internal/statname"
+	"github.com/remnawave/remnawave-node-go/internal/supervisor"
 	"github.com/remnawave/remnawave-node-go/internal/usagesnapshot"
 )
 
@@ -122,5 +125,85 @@ func TestActivateUsageSnapshotsRejectsIncompleteCoreBaseline(t *testing.T) {
 	}
 	if store.Active() {
 		t.Fatal("activation stored a baseline without core counters")
+	}
+}
+
+func TestRestartCoreSealsPreRestartUsageAndMarksRestart(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "sing-box.json")
+	lastGoodPath := filepath.Join(dir, "sing-box.last-good.json")
+	initialBytes := []byte(`{"inbounds":[{"tag":"in","type":"anytls","users":[]}]}`)
+	if err := os.WriteFile(configPath, initialBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &scriptedSnapshotStats{userValue: 1300}
+	manager, store := newSnapshotTestManager(t, client)
+	baseline := usagesnapshot.Counter{Kind: "user", Name: "22", Inbound: "in", Direction: "downlink", Value: 1000}
+	if _, err := store.Activate([]usagesnapshot.Counter{baseline}); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeSupervisor := newFakeProcessSupervisor()
+	fakeSupervisor.states[singBoxProcessName] = supervisor.StateRunning
+	manager.cfg = config.Config{
+		SingBoxConfigPath:   configPath,
+		SingBoxLastGoodPath: lastGoodPath,
+		SingBoxV2RayAPIPort: 61002,
+	}
+	manager.supervisor = fakeSupervisor
+	manager.runCommand = func(context.Context, string, ...string) ([]byte, error) { return nil, nil }
+	manager.healthTimeout = 100 * time.Millisecond
+	manager.healthPollInterval = time.Millisecond
+	manager.state.SetSingBoxConfig(map[string]any{
+		"inbounds": []any{map[string]any{"tag": "in", "type": "anytls", "users": []any{}}},
+	})
+	manager.state.SetOnlineStatus(true)
+
+	result := manager.AddUser(context.Background(), AddUserRequest{
+		Data: []AddUserItem{{Type: "anytls", Tag: "in", Username: "22", Password: "pw"}},
+	})
+	if result["response"].(map[string]any)["success"] != true {
+		t.Fatalf("AddUser failed: %#v", result)
+	}
+	// Pre-restart delta (1300 - 1000 = 300) must already be sealed, and the
+	// restart marker must be set for the next post-restart sample.
+	if billed := billedUserBytes(t, store); billed != 300 {
+		t.Fatalf("pre-restart billed = %d, want 300", billed)
+	}
+	if !manager.usageCoreRestarted {
+		t.Fatal("restartCurrentCore did not set usageCoreRestarted")
+	}
+
+	// Simulate post-restart counter starting at 0 and already surpassing the
+	// pre-restart 1300 baseline before the next periodic capture.
+	client.userValue = 1500
+	manager.CaptureUsageSnapshot(context.Background())
+	if billed := billedUserBytes(t, store); billed != 1800 {
+		t.Fatalf("total billed across user-update restart = %d, want 1800 (300 pre-restart + 1500 post-restart)", billed)
+	}
+}
+
+func TestStopSealsCoreUsageAndPreservesRestartMarkerWhileStopped(t *testing.T) {
+	client := &scriptedSnapshotStats{userValue: 1250}
+	manager, store := newSnapshotTestManager(t, client)
+	manager.supervisor = newFakeProcessSupervisor()
+	baseline := usagesnapshot.Counter{Kind: "user", Name: "22", Inbound: "in", Direction: "downlink", Value: 1000}
+	if _, err := store.Activate([]usagesnapshot.Counter{baseline}); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.Stop(context.Background())
+	if billed := billedUserBytes(t, store); billed != 250 {
+		t.Fatalf("billed on Stop = %d, want 250", billed)
+	}
+	if !manager.usageCoreRestarted {
+		t.Fatal("Stop did not set usageCoreRestarted")
+	}
+
+	// Sampling while the core is stopped must not consume usageCoreRestarted.
+	manager.CaptureUsageSnapshot(context.Background())
+	if !manager.usageCoreRestarted {
+		t.Fatal("stopped-core capture consumed usageCoreRestarted")
 	}
 }

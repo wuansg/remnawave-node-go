@@ -342,10 +342,8 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 	m.refreshOnlineStatus(ctx)
 	started := m.state.OnlineStatus()
 	m.logger.Info("node start request handled", "core", coreType, "remote_ip", remoteIP, "restarted", shouldRestart)
-	if shouldRestart && m.UsageSnapshotActive() {
-		m.usageMu.Lock()
-		m.usageCoreRestarted = true
-		m.usageMu.Unlock()
+	if shouldRestart {
+		m.markUsageCoreRestarted()
 	}
 	return wrapStartResponse(started, m.activeVersion(coreType), nil, m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), m.startConfigApplyResult(coreType))
 }
@@ -377,7 +375,9 @@ func (m *Manager) Stop(ctx context.Context) map[string]any {
 	m.coreMu.Lock()
 	defer m.coreMu.Unlock()
 
+	m.sealCoreUsageBeforeStop(ctx)
 	_ = m.supervisor.StopProcess(ctx, singBoxProcessName)
+	m.markUsageCoreRestarted()
 	m.state.SetRunningCore("")
 	m.state.SetOnlineStatus(false)
 	m.state.Reset()
@@ -529,11 +529,12 @@ func (m *Manager) captureUsageSnapshot(ctx context.Context) error {
 	if !capturing {
 		return nil
 	}
-	// Only consume the restart marker when every core counter was sampled.
-	// Otherwise the next complete sample still needs it to treat the post
-	// restart values as fresh traffic instead of a delta from the old baseline.
+	// Only consume the restart marker when a running core's counters were
+	// sampled in full. Otherwise the next complete core sample still needs it
+	// to treat the post-restart values as fresh traffic instead of a delta from
+	// the old baseline.
 	coreRestarted := false
-	if coreComplete {
+	if m.state.RunningCoreType() != "" && coreComplete {
 		m.usageMu.Lock()
 		coreRestarted = m.usageCoreRestarted
 		m.usageCoreRestarted = false
@@ -618,10 +619,31 @@ func (m *Manager) currentUsageCounters(ctx context.Context) ([]usagesnapshot.Cou
 	}
 	coreCounters, err := m.currentCoreUsageCounters(ctx)
 	if err != nil {
-		m.logger.Warn("skipping core usage counters for this snapshot", "error", err)
+		if m.logger != nil {
+			m.logger.Warn("skipping core usage counters for this snapshot", "error", err)
+		}
 		return result, true, false, nil
 	}
 	return append(result, coreCounters...), true, true, nil
+}
+
+func (m *Manager) markUsageCoreRestarted() {
+	if !m.UsageSnapshotActive() {
+		return
+	}
+	m.usageMu.Lock()
+	m.usageCoreRestarted = true
+	m.usageMu.Unlock()
+}
+
+// sealCoreUsageBeforeStop requires coreMu to be held by the caller.
+func (m *Manager) sealCoreUsageBeforeStop(ctx context.Context) {
+	if !m.UsageSnapshotActive() || m.state.RunningCoreType() != state.CoreTypeSingBox {
+		return
+	}
+	if err := m.captureUsageSnapshot(ctx); err != nil && m.logger != nil {
+		m.logger.Warn("failed to seal usage snapshot before stopping core", "error", err)
+	}
 }
 
 func (m *Manager) currentCoreUsageCounters(ctx context.Context) ([]usagesnapshot.Counter, error) {
@@ -1145,6 +1167,9 @@ func pluginCompileSummary(plugin state.PluginState) map[string]any {
 }
 
 func (m *Manager) BlockIPs(ctx context.Context, request BlockIPsRequest) map[string]any {
+	m.coreMu.Lock()
+	defer m.coreMu.Unlock()
+
 	for _, item := range request.IPs {
 		if err := m.blockIPWithTimeout(ctx, item.IP, item.Timeout); err != nil {
 			return map[string]any{"response": map[string]any{"accepted": false}}
@@ -1154,6 +1179,9 @@ func (m *Manager) BlockIPs(ctx context.Context, request BlockIPsRequest) map[str
 }
 
 func (m *Manager) UnblockIPs(ctx context.Context, request UnblockIPsRequest) map[string]any {
+	m.coreMu.Lock()
+	defer m.coreMu.Unlock()
+
 	for _, ip := range request.IPs {
 		m.state.DeleteBlockedIP(ip)
 		if m.nftReady {
@@ -1173,7 +1201,13 @@ func (m *Manager) UnblockIPs(ctx context.Context, request UnblockIPsRequest) map
 }
 
 func (m *Manager) RecreateTables(ctx context.Context) map[string]any {
+	m.coreMu.Lock()
+	defer m.coreMu.Unlock()
+
 	if err := m.recreateNFTables(ctx); err != nil {
+		return map[string]any{"response": map[string]any{"accepted": false}}
+	}
+	if err := m.syncNFTState(ctx, m.state.PluginState()); err != nil {
 		return map[string]any{"response": map[string]any{"accepted": false}}
 	}
 	return map[string]any{"response": map[string]any{"accepted": true}}
@@ -1270,7 +1304,9 @@ func (m *Manager) restartSingBox(ctx context.Context, config map[string]any) err
 		return fmt.Errorf("sync sing-box configuration directory: %w", err)
 	}
 
+	m.sealCoreUsageBeforeStop(ctx)
 	_ = m.supervisor.StopProcess(ctx, singBoxProcessName)
+	m.markUsageCoreRestarted()
 	if err := m.supervisor.StartProcess(ctx, singBoxProcessName); err != nil {
 		return m.failSingBoxActivation(ctx, fmt.Errorf("start sing-box: %w", err), requestedHash, previousHash, attemptedAt, previousCore, previousRuntimeConfig, previousConfig, hadPreviousConfig, configPath, lastGoodPath)
 	}
@@ -1373,6 +1409,7 @@ func (m *Manager) failSingBoxActivation(ctx context.Context, activationErr error
 
 func (m *Manager) rollbackSingBox(ctx context.Context, previousCore state.CoreType, previousRuntimeConfig map[string]any, previousConfig []byte, hadPreviousConfig bool, configPath, lastGoodPath string) error {
 	_ = m.supervisor.StopProcess(ctx, singBoxProcessName)
+	m.markUsageCoreRestarted()
 
 	restoreErr := restoreOptionalFile(configPath, previousConfig, hadPreviousConfig, 0o644)
 	if !hadPreviousConfig {
@@ -1732,6 +1769,46 @@ func (m *Manager) recreateNFTables(ctx context.Context) error {
 			return err
 		}
 	}
+	return m.syncBlockedIPsNFT(ctx)
+}
+
+func (m *Manager) syncBlockedIPsNFT(ctx context.Context) error {
+	if !m.nftReady {
+		return nil
+	}
+	blocked := m.state.BlockedIPs()
+	if len(blocked) == 0 {
+		return nil
+	}
+	ips := make([]string, 0, len(blocked))
+	for ip := range blocked {
+		ips = append(ips, ip)
+	}
+	sort.Strings(ips)
+	now := time.Now()
+	for _, ip := range ips {
+		until := blocked[ip]
+		if !until.IsZero() && !until.After(now) {
+			m.state.DeleteBlockedIP(ip)
+			continue
+		}
+		family, valid := nftSetFamily(ip)
+		if !valid {
+			continue
+		}
+		args := []string{"add", "element", "inet", nftTableName, "temporary-blocked-ip" + family, "{", ip}
+		if !until.IsZero() {
+			remaining := int(until.Sub(now).Seconds())
+			if remaining < 1 {
+				remaining = 1
+			}
+			args = append(args, "timeout", fmt.Sprintf("%ds", remaining))
+		}
+		args = append(args, "}")
+		if err := m.runNft(ctx, args...); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1874,8 +1951,11 @@ func (m *Manager) nftDeleteElement(ctx context.Context, setName, value string) e
 }
 
 func (m *Manager) runNft(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, "nft", args...)
-	output, err := cmd.CombinedOutput()
+	runner := m.runCommand
+	if runner == nil {
+		runner = runCombinedOutput
+	}
+	output, err := runner(ctx, "nft", args...)
 	if err != nil && len(output) > 0 && strings.Contains(string(output), "No such file or directory") {
 		return nil
 	}
@@ -2050,6 +2130,8 @@ func readSharedLists(config map[string]any) map[string]pluginSharedList {
 			switch value := item.(type) {
 			case string:
 				items = append(items, value)
+			case int:
+				items = append(items, strconv.Itoa(value))
 			case float64:
 				if value == float64(int(value)) {
 					items = append(items, strconv.Itoa(int(value)))
@@ -2186,6 +2268,8 @@ func resolvePortList(values []any, shared map[string]pluginSharedList) []int {
 	}
 	for _, item := range values {
 		switch value := item.(type) {
+		case int:
+			appendValue(strconv.Itoa(value))
 		case float64:
 			appendValue(strconv.Itoa(int(value)))
 		case string:

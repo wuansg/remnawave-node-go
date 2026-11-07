@@ -364,7 +364,17 @@ func TestRetiredPluginsDoNotRestartCore(t *testing.T) {
 func TestManualBlockingSurvivesPluginRemoval(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // Do not execute the host's ss command.
 	runtimeState := state.New("test")
-	manager := &Manager{state: runtimeState}
+	var nftCommands []string
+	manager := &Manager{
+		state:    runtimeState,
+		nftReady: true,
+		runCommand: func(_ context.Context, binary string, args ...string) ([]byte, error) {
+			if binary == "nft" {
+				nftCommands = append(nftCommands, strings.Join(args, " "))
+			}
+			return nil, nil
+		},
+	}
 	for _, ip := range []string{"198.51.100.2", "2001:db8::2"} {
 		if err := manager.blockIPWithTimeout(context.Background(), ip, 60); err != nil {
 			t.Fatal(err)
@@ -372,6 +382,52 @@ func TestManualBlockingSurvivesPluginRemoval(t *testing.T) {
 		if until, ok := runtimeState.BlockedIPs()[ip]; !ok || !until.After(time.Now()) {
 			t.Fatalf("manual timed block missing for %s", ip)
 		}
+	}
+	runtimeState.SetBlockedIP("192.0.2.9", time.Now().Add(-time.Minute))
+
+	plugin := struct {
+		Config map[string]any `json:"config"`
+		UUID   string         `json:"uuid"`
+		Name   string         `json:"name"`
+	}{Config: map[string]any{
+		"ingressFilter": map[string]any{"enabled": true, "blockedIps": []any{"198.51.100.1"}},
+		"egressFilter":  map[string]any{"enabled": true, "blockedPorts": []any{25}},
+	}}
+	if res := manager.SyncPlugin(context.Background(), PluginSyncRequest{Plugin: &plugin}); res["response"].(map[string]any)["accepted"] != true {
+		t.Fatalf("plugin sync failed: %#v", res)
+	}
+
+	nftCommands = nil
+	if res := manager.RecreateTables(context.Background()); res["response"].(map[string]any)["accepted"] != true {
+		t.Fatalf("recreate tables failed: %#v", res)
+	}
+	joined := strings.Join(nftCommands, "\n")
+	if !strings.Contains(joined, "add element inet remnanode temporary-blocked-ip { 198.51.100.2 timeout ") {
+		t.Fatalf("RecreateTables did not restore IPv4 temporary block:\n%s", joined)
+	}
+	if !strings.Contains(joined, "add element inet remnanode temporary-blocked-ip6 { 2001:db8::2 timeout ") {
+		t.Fatalf("RecreateTables did not restore IPv6 temporary block:\n%s", joined)
+	}
+	if !strings.Contains(joined, "add element inet remnanode ingress-filter-ip { 198.51.100.1 }") {
+		t.Fatalf("RecreateTables did not restore plugin ingress filter:\n%s", joined)
+	}
+	if !strings.Contains(joined, "add element inet remnanode egress-filter-port { 25 }") {
+		t.Fatalf("RecreateTables did not restore plugin egress port filter:\n%s", joined)
+	}
+	if _, ok := runtimeState.BlockedIPs()["192.0.2.9"]; ok {
+		t.Fatal("expired blocked IP was not pruned during table recreation")
+	}
+
+	nftCommands = nil
+	if res := manager.SyncPlugin(context.Background(), PluginSyncRequest{Plugin: nil}); res["response"].(map[string]any)["accepted"] != true {
+		t.Fatalf("plugin removal failed: %#v", res)
+	}
+	joinedAfterRemoval := strings.Join(nftCommands, "\n")
+	if !strings.Contains(joinedAfterRemoval, "add element inet remnanode temporary-blocked-ip { 198.51.100.2 timeout ") {
+		t.Fatalf("plugin removal dropped active temporary-blocked-ip:\n%s", joinedAfterRemoval)
+	}
+
+	for _, ip := range []string{"198.51.100.2", "2001:db8::2"} {
 		result := manager.UnblockIPs(context.Background(), UnblockIPsRequest{IPs: []string{ip}})
 		if result["response"].(map[string]any)["accepted"] != true {
 			t.Fatalf("manual unblock failed: %#v", result)
