@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -133,7 +134,31 @@ func (p singBoxUserConnectionProvider) deleteConnection(ctx context.Context, id 
 	return err
 }
 
+type singBoxHotReloadUsersPayload struct {
+	Inbounds   []map[string]any `json:"inbounds"`
+	StatsUsers []string         `json:"statsUsers"`
+}
+
+func (p singBoxUserConnectionProvider) UpdateInboundUsers(ctx context.Context, inbounds []map[string]any, statsUsers []string) error {
+	if !p.canUseAPI() {
+		return ErrUserConnectionStatsUnsupported
+	}
+	payload, err := json.Marshal(singBoxHotReloadUsersPayload{
+		Inbounds:   inbounds,
+		StatsUsers: statsUsers,
+	})
+	if err != nil {
+		return fmt.Errorf("encode sing-box hot-reload users payload: %w", err)
+	}
+	_, err = p.doJSONRequestWithBody(ctx, http.MethodPut, "/configs/users", payload)
+	return err
+}
+
 func (p singBoxUserConnectionProvider) doJSONRequest(ctx context.Context, method, path string) ([]byte, error) {
+	return p.doJSONRequestWithBody(ctx, method, path, nil)
+}
+
+func (p singBoxUserConnectionProvider) doJSONRequestWithBody(ctx context.Context, method, path string, requestBody []byte) ([]byte, error) {
 	callCtx := ctx
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -141,11 +166,18 @@ func (p singBoxUserConnectionProvider) doJSONRequest(ctx context.Context, method
 		defer cancel()
 	}
 
-	request, err := http.NewRequestWithContext(callCtx, method, p.apiBaseURL+path, nil)
+	var bodyReader io.Reader
+	if requestBody != nil {
+		bodyReader = bytes.NewReader(requestBody)
+	}
+	request, err := http.NewRequestWithContext(callCtx, method, p.apiBaseURL+path, bodyReader)
 	if err != nil {
 		return nil, err
 	}
 	request.Header.Set("Accept", "application/json")
+	if requestBody != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
 	if p.apiSecret != "" {
 		request.Header.Set("Authorization", "Bearer "+p.apiSecret)
 	}

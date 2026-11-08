@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const defaultVersion = "3.16.3"
+const defaultVersion = "3.16.4"
 
 var buildVersion = defaultVersion
 

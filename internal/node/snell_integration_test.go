@@ -234,26 +234,26 @@ func TestSnellIntegration(t *testing.T) {
 			t.Fatalf("missing separate upload/download for %s: %v", id, counts)
 		}
 	}
-	stopServer()
-	stopServer = start("revoked-server", serverConfig(users[:1]), snellPort)
+	provider := newSingBoxUserConnectionProvider(clashPort, "")
+	revokedCfg := serverConfig(users[:1])
+	revokedInbounds := asMapSlice(revokedCfg["inbounds"])
+	if err := provider.UpdateInboundUsers(ctx, revokedInbounds, []string{statname.UserInbound("18", "snell")}); err != nil {
+		t.Fatalf("hot-reload revoked user: %v", err)
+	}
 	if err := request(proxies[1]); err == nil {
-		t.Fatal("removed user still connects")
+		t.Fatal("removed user still connects after hot-reload")
 	}
-	// Core restarts (how user changes apply) kill pooled Snell connections and
-	// clients do not retry a stale one: allow those requests to fail, but the
-	// next one must dial a fresh connection.
-	var restartErr error
-	for i := 0; i < 3; i++ {
-		if restartErr = request(proxies[0]); restartErr == nil {
-			break
-		}
+	// Hot-reload preserves the remaining user's pooled Snell connection and stats counters without restarting sing-box.
+	if err := request(proxies[0]); err != nil {
+		t.Fatalf("remaining user broken after hot-reload: %v", err)
 	}
-	if restartErr != nil {
-		t.Fatalf("remaining user broken: %v", restartErr)
+	emptyCfg := serverConfig([]any{})
+	emptyInbounds := asMapSlice(emptyCfg["inbounds"])
+	if err := provider.UpdateInboundUsers(ctx, emptyInbounds, []string{}); err != nil {
+		t.Fatalf("hot-reload empty users: %v", err)
+	}
+	if err := request(proxies[0]); err == nil {
+		t.Fatal("empty users permits access after hot-reload")
 	}
 	stopServer()
-	start("empty-server", serverConfig([]any{}), snellPort)
-	if err := request(proxies[0]); err == nil {
-		t.Fatal("empty users permits access")
-	}
 }

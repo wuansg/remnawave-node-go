@@ -325,13 +325,27 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 	if len(config) == 0 {
 		return wrapStartResponse(false, nil, ptrString("singBoxConfig is required for SING_BOX core"), m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), nil)
 	}
-	if err := m.forwarding.ValidateCoreConfig(string(coreType), config); err != nil {
-		return m.coreConflictResponse(ctx, err)
+	if m.forwarding != nil {
+		if err := m.forwarding.ValidateCoreConfig(string(coreType), config); err != nil {
+			return m.coreConflictResponse(ctx, err)
+		}
 	}
 	shouldRestart = shouldRestart || !reflect.DeepEqual(m.state.SingBoxConfig(), config)
+	restarted := false
+	hotReloaded := false
 	if shouldRestart {
-		if err := m.restartSingBox(ctx, config); err != nil {
-			return m.coreActivationFailureResponse(ctx, err, snapshot)
+		if m.canHotReloadSingBoxConfig(coreType, request.Internals.ForceRestart, config) {
+			if err := m.hotReloadSingBoxUsers(ctx, config); err == nil {
+				hotReloaded = true
+			} else if m.logger != nil {
+				m.logger.Warn("sing-box user hot-reload failed during start, falling back to restart", "error", err)
+			}
+		}
+		if !hotReloaded {
+			if err := m.restartSingBox(ctx, config); err != nil {
+				return m.coreActivationFailureResponse(ctx, err, snapshot)
+			}
+			restarted = true
 		}
 	} else {
 		m.state.SetSingBoxConfig(config)
@@ -341,8 +355,10 @@ func (m *Manager) Start(ctx context.Context, request StartRequest, remoteIP stri
 	m.state.SetLastHashes(request.Internals.Hashes)
 	m.refreshOnlineStatus(ctx)
 	started := m.state.OnlineStatus()
-	m.logger.Info("node start request handled", "core", coreType, "remote_ip", remoteIP, "restarted", shouldRestart)
-	if shouldRestart {
+	if m.logger != nil {
+		m.logger.Info("node start request handled", "core", coreType, "remote_ip", remoteIP, "restarted", restarted, "hot_reloaded", hotReloaded)
+	}
+	if restarted {
 		m.markUsageCoreRestarted()
 	}
 	return wrapStartResponse(started, m.activeVersion(coreType), nil, m.state.NodeVersion(), snapshot, string(coreType), m.coreVersions(), m.startConfigApplyResult(coreType))
@@ -1216,8 +1232,182 @@ func (m *Manager) RecreateTables(ctx context.Context) map[string]any {
 func (m *Manager) restartCurrentCore(ctx context.Context) error {
 	m.state.MarkHashesDirty()
 	if m.state.RunningCoreType() == state.CoreTypeSingBox {
-		return m.restartSingBox(ctx, m.state.SingBoxConfig())
+		config := m.state.SingBoxConfig()
+		if m.state.OnlineStatus() && m.canHotReloadSingBoxUsers() {
+			if err := m.hotReloadSingBoxUsers(ctx, config); err == nil {
+				return nil
+			} else if m.logger != nil {
+				m.logger.Warn("sing-box user hot-reload failed, falling back to restart", "error", err)
+			}
+		}
+		return m.restartSingBox(ctx, config)
 	}
+	return nil
+}
+
+func (m *Manager) canHotReloadSingBoxUsers() bool {
+	return m.cfg.SingBoxAPIPort > 0
+}
+
+func (m *Manager) canHotReloadSingBoxConfig(coreType state.CoreType, forceRestart bool, targetConfig map[string]any) bool {
+	if forceRestart || m.cfg.DisableHashCheck {
+		return false
+	}
+	if m.state.RunningCoreType() != coreType || !m.state.OnlineStatus() {
+		return false
+	}
+	if !m.canHotReloadSingBoxUsers() {
+		return false
+	}
+	currentConfig := applySingBoxAPIConfig(normalizeSingBoxKeys(m.state.SingBoxConfig()), m.cfg)
+	return singBoxConfigsEqualIgnoringUsers(currentConfig, targetConfig)
+}
+
+func isHotReloadableSingBoxInbound(inbound map[string]any) bool {
+	switch normalizeSingBoxType(stringValue(inbound["type"])) {
+	case "vless", "vmess", "trojan", "anytls", "shadowtls", "snell", "hysteria2", "tuic":
+		return true
+	case "shadowsocks":
+		_, hasUsers := inbound["users"]
+		return hasUsers || boolValue(inbound["managed"])
+	default:
+		return false
+	}
+}
+
+func singBoxConfigsEqualIgnoringUsers(currentConfig, targetConfig map[string]any) bool {
+	if len(currentConfig) == 0 || len(targetConfig) == 0 {
+		return false
+	}
+	aCopy := cloneMap(currentConfig)
+	bCopy := cloneMap(targetConfig)
+	inboundsA := asMapSlice(aCopy["inbounds"])
+	inboundsB := asMapSlice(bCopy["inbounds"])
+	if len(inboundsA) == 0 || len(inboundsA) != len(inboundsB) {
+		return false
+	}
+	hasHotReloadable := false
+	for i := range inboundsA {
+		tagA := stringValue(inboundsA[i]["tag"])
+		tagB := stringValue(inboundsB[i]["tag"])
+		typeA := normalizeSingBoxType(stringValue(inboundsA[i]["type"]))
+		typeB := normalizeSingBoxType(stringValue(inboundsB[i]["type"]))
+		if tagA == "" || tagA != tagB || typeA == "" || typeA != typeB {
+			return false
+		}
+		if isHotReloadableSingBoxInbound(inboundsA[i]) && isHotReloadableSingBoxInbound(inboundsB[i]) {
+			hasHotReloadable = true
+			delete(inboundsA[i], "users")
+			delete(inboundsB[i], "users")
+		}
+	}
+	if !hasHotReloadable {
+		return false
+	}
+	aCopy["inbounds"] = toAnySlice(inboundsA)
+	bCopy["inbounds"] = toAnySlice(inboundsB)
+	stripSingBoxStatsUsers(aCopy)
+	stripSingBoxStatsUsers(bCopy)
+	return reflect.DeepEqual(aCopy, bCopy)
+}
+
+func stripSingBoxStatsUsers(config map[string]any) {
+	exp, ok := config["experimental"].(map[string]any)
+	if !ok {
+		return
+	}
+	v2rayAPI, ok := exp["v2ray_api"].(map[string]any)
+	if !ok {
+		return
+	}
+	stats, ok := v2rayAPI["stats"].(map[string]any)
+	if !ok {
+		return
+	}
+	delete(stats, "users")
+}
+
+func (m *Manager) hotReloadSingBoxUsers(ctx context.Context, config map[string]any) error {
+	config = applySingBoxAPIConfig(normalizeSingBoxKeys(cloneMap(config)), m.cfg)
+	hotReloadInbounds := make([]map[string]any, 0)
+	for _, inbound := range asMapSlice(config["inbounds"]) {
+		if !isHotReloadableSingBoxInbound(inbound) {
+			continue
+		}
+		clonedInbound := cloneMap(inbound)
+		if _, ok := clonedInbound["users"]; !ok {
+			clonedInbound["users"] = []any{}
+		}
+		hotReloadInbounds = append(hotReloadInbounds, clonedInbound)
+	}
+	if len(hotReloadInbounds) == 0 {
+		return errors.New("no hot-reloadable sing-box inbounds in configuration")
+	}
+
+	statsUsers := []string{}
+	if exp, ok := config["experimental"].(map[string]any); ok {
+		if v2rayAPI, ok := exp["v2ray_api"].(map[string]any); ok {
+			if stats, ok := v2rayAPI["stats"].(map[string]any); ok {
+				statsUsers = valueStrings(stats["users"])
+			}
+		}
+	}
+
+	configPath := m.cfg.SingBoxConfigPath
+	if configPath == "" {
+		configPath = "/run/remnawave/sing-box.json"
+	}
+	configDir := filepath.Dir(configPath)
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return fmt.Errorf("create sing-box configuration directory: %w", err)
+	}
+	encoded, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode sing-box configuration: %w", err)
+	}
+	attemptedAt := time.Now().UTC()
+	requestedHash := hashConfigBytes(encoded)
+
+	candidatePath, err := writeCandidateFile(configPath, encoded)
+	if err != nil {
+		return fmt.Errorf("write sing-box candidate configuration: %w", err)
+	}
+	candidateOwned := true
+	defer func() {
+		if candidateOwned {
+			_ = os.Remove(candidatePath)
+		}
+	}()
+
+	if err := m.checkSingBoxConfig(ctx, candidatePath); err != nil {
+		return err
+	}
+
+	provider := newSingBoxUserConnectionProvider(m.cfg.SingBoxAPIPort, m.cfg.InternalRESTToken)
+	if err := provider.UpdateInboundUsers(ctx, hotReloadInbounds, statsUsers); err != nil {
+		return err
+	}
+
+	if err := os.Chmod(candidatePath, 0o644); err != nil {
+		return fmt.Errorf("set sing-box candidate permissions: %w", err)
+	}
+	if err := os.Rename(candidatePath, configPath); err != nil {
+		return fmt.Errorf("activate sing-box candidate configuration: %w", err)
+	}
+	candidateOwned = false
+	if err := syncDirectory(configDir); err != nil {
+		return fmt.Errorf("sync sing-box configuration directory: %w", err)
+	}
+	lastGoodPath := m.singBoxLastGoodPath(configPath)
+	if err := writeFileAtomic(lastGoodPath, encoded, 0o600); err != nil {
+		return fmt.Errorf("persist sing-box last-known-good configuration: %w", err)
+	}
+
+	appliedAt := time.Now().UTC()
+	m.singBoxApplyResult = newSingBoxApplyResult("APPLIED", requestedHash, requestedHash, attemptedAt, &appliedAt, "NOT_REQUIRED")
+	m.state.SetSingBoxConfig(config)
+	m.state.SetRunningCore(state.CoreTypeSingBox)
+	m.refreshOnlineStatus(ctx)
 	return nil
 }
 

@@ -1,0 +1,2101 @@
+diff --git a/adapter/experimental.go b/adapter/experimental.go
+index 493d802..c4041e6 100644
+--- a/adapter/experimental.go
++++ b/adapter/experimental.go
+@@ -30,6 +30,10 @@ type V2RayServer interface {
+ 	StatsService() ConnectionTracker
+ }
+ 
++type StatsUserUpdater interface {
++	UpdateUsers(users []string)
++}
++
+ type CacheFile interface {
+ 	LifecycleService
+ 
+diff --git a/adapter/inbound.go b/adapter/inbound.go
+index ae1067d..a1973d4 100644
+--- a/adapter/inbound.go
++++ b/adapter/inbound.go
+@@ -21,6 +21,10 @@ type Inbound interface {
+ 	Tag() string
+ }
+ 
++type InboundUserUpdater interface {
++	UpdateInboundUsers(options any) error
++}
++
+ type TCPInjectableInbound interface {
+ 	Inbound
+ 	ConnectionHandler
+diff --git a/experimental/clashapi/configs.go b/experimental/clashapi/configs.go
+index 8ae1d25..05c1104 100644
+--- a/experimental/clashapi/configs.go
++++ b/experimental/clashapi/configs.go
+@@ -1,9 +1,15 @@
+ package clashapi
+ 
+ import (
++	"io"
+ 	"net/http"
+ 
++	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	F "github.com/sagernet/sing/common/format"
++	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/service"
+ 
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/go-chi/render"
+@@ -13,6 +19,7 @@ func configRouter(server *Server, logFactory log.Factory) http.Handler {
+ 	r := chi.NewRouter()
+ 	r.Get("/", getConfigs(server, logFactory))
+ 	r.Put("/", updateConfigs)
++	r.Put("/users", updateInboundUsers(server))
+ 	r.Patch("/", patchConfigs(server))
+ 	return r
+ }
+@@ -69,3 +76,144 @@ func patchConfigs(server *Server) func(w http.ResponseWriter, r *http.Request) {
+ func updateConfigs(w http.ResponseWriter, r *http.Request) {
+ 	render.NoContent(w, r)
+ }
++
++type updateInboundUsersRequest struct {
++	Inbounds   []option.Inbound `json:"inbounds"`
++	StatsUsers []string         `json:"statsUsers,omitempty"`
++}
++
++func updateInboundUsers(server *Server) func(w http.ResponseWriter, r *http.Request) {
++	return func(w http.ResponseWriter, r *http.Request) {
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			render.Status(r, http.StatusBadRequest)
++			render.JSON(w, r, newError(err.Error()))
++			return
++		}
++		var req updateInboundUsersRequest
++		if err := json.UnmarshalContext(server.ctx, body, &req); err != nil {
++			render.Status(r, http.StatusBadRequest)
++			render.JSON(w, r, newError(err.Error()))
++			return
++		}
++		inboundManager := service.FromContext[adapter.InboundManager](server.ctx)
++		if inboundManager == nil {
++			render.Status(r, http.StatusServiceUnavailable)
++			render.JSON(w, r, newError("missing inbound manager"))
++			return
++		}
++		type targetInbound struct {
++			tag     string
++			updater adapter.InboundUserUpdater
++			options any
++		}
++		targets := make([]targetInbound, 0, len(req.Inbounds))
++		for index, inb := range req.Inbounds {
++			tag := inb.Tag
++			if tag == "" {
++				tag = F.ToString(index)
++			}
++			runningInbound, loaded := inboundManager.Get(tag)
++			if !loaded || runningInbound.Type() != inb.Type {
++				render.Status(r, http.StatusBadRequest)
++				render.JSON(w, r, newError("inbound not found or type mismatch: "+tag))
++				return
++			}
++			updater, ok := runningInbound.(adapter.InboundUserUpdater)
++			if !ok {
++				render.Status(r, http.StatusBadRequest)
++				render.JSON(w, r, newError("inbound does not support user hot-reload: "+tag))
++				return
++			}
++			targets = append(targets, targetInbound{
++				tag:     tag,
++				updater: updater,
++				options: inb.Options,
++			})
++		}
++		if req.StatsUsers != nil {
++			if v2rayServer := service.FromContext[adapter.V2RayServer](server.ctx); v2rayServer != nil {
++				if statsUpdater, ok := v2rayServer.StatsService().(adapter.StatsUserUpdater); ok {
++					statsUpdater.UpdateUsers(req.StatsUsers)
++				}
++			}
++		}
++		allowedByInbound := make(map[string]map[string]bool, len(targets))
++		for _, target := range targets {
++			if err := target.updater.UpdateInboundUsers(target.options); err != nil {
++				render.Status(r, http.StatusBadRequest)
++				render.JSON(w, r, newError(err.Error()))
++				return
++			}
++			allowedByInbound[target.tag] = extractInboundUserNames(target.options)
++		}
++		closedConnections := 0
++		if server.trafficManager != nil {
++			for _, meta := range server.trafficManager.Connections() {
++				if meta.Metadata.User == "" {
++					continue
++				}
++				allowed, updated := allowedByInbound[meta.Metadata.Inbound]
++				if !updated || allowed[meta.Metadata.User] {
++					continue
++				}
++				if tracker := server.trafficManager.Connection(meta.ID); tracker != nil {
++					tracker.Close()
++					closedConnections++
++				}
++			}
++		}
++		render.JSON(w, r, render.M{
++			"status":            "ok",
++			"closedConnections": closedConnections,
++		})
++	}
++}
++
++func extractInboundUserNames(rawOptions any) map[string]bool {
++	names := make(map[string]bool)
++	addName := func(name string) {
++		if name != "" {
++			names[name] = true
++		}
++	}
++	switch opts := rawOptions.(type) {
++	case *option.VLESSInboundOptions:
++		for _, u := range opts.Users {
++			addName(u.Name)
++		}
++	case *option.VMessInboundOptions:
++		for _, u := range opts.Users {
++			addName(u.Name)
++		}
++	case *option.TrojanInboundOptions:
++		for _, u := range opts.Users {
++			addName(u.Name)
++		}
++	case *option.AnyTLSInboundOptions:
++		for _, u := range opts.Users {
++			addName(u.Name)
++		}
++	case *option.ShadowTLSInboundOptions:
++		for _, u := range opts.Users {
++			addName(u.Name)
++		}
++	case *option.SnellInboundOptions:
++		for _, u := range opts.Users {
++			addName(u.Name)
++		}
++	case *option.ShadowsocksInboundOptions:
++		for _, u := range opts.Users {
++			addName(u.Name)
++		}
++	case *option.Hysteria2InboundOptions:
++		for _, u := range opts.Users {
++			addName(u.Name)
++		}
++	case *option.TUICInboundOptions:
++		for _, u := range opts.Users {
++			addName(u.Name)
++		}
++	}
++	return names
++}
+diff --git a/experimental/v2rayapi/stats.go b/experimental/v2rayapi/stats.go
+index 6f38fdd..e5f1768 100644
+--- a/experimental/v2rayapi/stats.go
++++ b/experimental/v2rayapi/stats.go
+@@ -24,6 +24,7 @@ func init() {
+ 
+ var (
+ 	_ adapter.ConnectionTracker = (*StatsService)(nil)
++	_ adapter.StatsUserUpdater  = (*StatsService)(nil)
+ 	_ StatsServiceServer        = (*StatsService)(nil)
+ )
+ 
+@@ -61,6 +62,18 @@ func NewStatsService(options option.V2RayStatsServiceOptions) *StatsService {
+ 	}
+ }
+ 
++func (s *StatsService) UpdateUsers(users []string) {
++	s.access.Lock()
++	defer s.access.Unlock()
++	updated := make(map[string]bool, len(users))
++	for _, user := range users {
++		if user != "" {
++			updated[user] = true
++		}
++	}
++	s.users = updated
++}
++
+ func (s *StatsService) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
+ 	inbound := metadata.Inbound
+ 	user := metadata.User
+@@ -69,11 +82,12 @@ func (s *StatsService) RoutedConnection(ctx context.Context, conn net.Conn, meta
+ 	var writeCounter []*atomic.Int64
+ 	countInbound := inbound != "" && s.inbounds[inbound]
+ 	countOutbound := outbound != "" && s.outbounds[outbound]
++	s.access.Lock()
+ 	countUser := user != "" && s.users[user]
+ 	if !countInbound && !countOutbound && !countUser {
++		s.access.Unlock()
+ 		return conn
+ 	}
+-	s.access.Lock()
+ 	if countInbound {
+ 		readCounter = append(readCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
+ 		writeCounter = append(writeCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
+@@ -98,11 +112,12 @@ func (s *StatsService) RoutedPacketConnection(ctx context.Context, conn N.Packet
+ 	var writeCounter []*atomic.Int64
+ 	countInbound := inbound != "" && s.inbounds[inbound]
+ 	countOutbound := outbound != "" && s.outbounds[outbound]
++	s.access.Lock()
+ 	countUser := user != "" && s.users[user]
+ 	if !countInbound && !countOutbound && !countUser {
++		s.access.Unlock()
+ 		return conn
+ 	}
+-	s.access.Lock()
+ 	if countInbound {
+ 		readCounter = append(readCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
+ 		writeCounter = append(writeCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
+@@ -127,11 +142,12 @@ func (s *StatsService) RoutedFlow(ctx context.Context, metadata adapter.InboundC
+ 	var downlinkCounter []*atomic.Int64
+ 	countInbound := inbound != "" && s.inbounds[inbound]
+ 	countOutbound := outbound != "" && s.outbounds[outbound]
++	s.access.Lock()
+ 	countUser := user != "" && s.users[user]
+ 	if !countInbound && !countOutbound && !countUser {
++		s.access.Unlock()
+ 		return nil
+ 	}
+-	s.access.Lock()
+ 	if countInbound {
+ 		uplinkCounter = append(uplinkCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
+ 		downlinkCounter = append(downlinkCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
+diff --git a/protocol/anytls/inbound.go b/protocol/anytls/inbound.go
+index f85b8f7..99f5c11 100644
+--- a/protocol/anytls/inbound.go
++++ b/protocol/anytls/inbound.go
+@@ -3,7 +3,9 @@ package anytls
+ import (
+ 	"context"
+ 	"net"
++	"os"
+ 	"strings"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -28,13 +30,18 @@ func RegisterInbound(registry *inbound.Registry) {
+ 	inbound.Register[option.AnyTLSInboundOptions](registry, C.TypeAnyTLS, NewInbound)
+ }
+ 
++var _ adapter.InboundUserUpdater = (*Inbound)(nil)
++
+ type Inbound struct {
+ 	inbound.Adapter
+-	tlsConfig tls.ServerConfig
+-	router    adapter.ConnectionRouterEx
+-	logger    logger.ContextLogger
+-	listener  *listener.Listener
+-	service   *anytls.Service
++	tlsConfig     tls.ServerConfig
++	router        adapter.ConnectionRouterEx
++	logger        logger.ContextLogger
++	listener      *listener.Listener
++	userAccess    sync.RWMutex
++	paddingScheme []byte
++	service       *anytls.Service
++	allowedUsers  map[string]bool
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSInboundOptions) (adapter.Inbound, error) {
+@@ -56,15 +63,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if len(options.PaddingScheme) > 0 {
+ 		paddingScheme = []byte(strings.Join(options.PaddingScheme, "\n"))
+ 	}
++	inbound.paddingScheme = paddingScheme
+ 
+-	service, err := anytls.NewService(anytls.ServiceConfig{
+-		Users: common.Map(options.Users, func(it option.AnyTLSUser) anytls.User {
+-			return anytls.User(it)
+-		}),
+-		PaddingScheme: paddingScheme,
+-		Handler:       (*inboundHandler)(inbound),
+-		Logger:        logger,
+-	})
++	service, err := inbound.buildService(options.Users)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -79,6 +80,54 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	return inbound, nil
+ }
+ 
++func (h *Inbound) buildService(users []option.AnyTLSUser) (*anytls.Service, error) {
++	return anytls.NewService(anytls.ServiceConfig{
++		Users: common.Map(users, func(it option.AnyTLSUser) anytls.User {
++			return anytls.User(it)
++		}),
++		PaddingScheme: h.paddingScheme,
++		Handler:       (*inboundHandler)(h),
++		Logger:        h.logger,
++	})
++}
++
++func (h *Inbound) UpdateInboundUsers(rawOptions any) error {
++	var users []option.AnyTLSUser
++	switch opts := rawOptions.(type) {
++	case *option.AnyTLSInboundOptions:
++		if opts == nil {
++			return os.ErrInvalid
++		}
++		users = opts.Users
++	case option.AnyTLSInboundOptions:
++		users = opts.Users
++	default:
++		return os.ErrInvalid
++	}
++	service, err := h.buildService(users)
++	if err != nil {
++		return err
++	}
++	allowedUsers := make(map[string]bool, len(users))
++	for _, u := range users {
++		if u.Name != "" {
++			allowedUsers[u.Name] = true
++		}
++	}
++	h.userAccess.Lock()
++	h.allowedUsers = allowedUsers
++	h.service = service
++	h.userAccess.Unlock()
++	return nil
++}
++
++func (h *Inbound) isUserAllowed(user string) bool {
++	h.userAccess.RLock()
++	allowed := h.allowedUsers == nil || h.allowedUsers[user]
++	h.userAccess.RUnlock()
++	return allowed
++}
++
+ func (h *Inbound) Start(stage adapter.StartStage) error {
+ 	if stage != adapter.StartStateStart {
+ 		return nil
+@@ -106,7 +155,10 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ 		}
+ 		conn = tlsConn
+ 	}
+-	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
++	h.userAccess.RLock()
++	service := h.service
++	h.userAccess.RUnlock()
++	err := service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+@@ -124,7 +176,12 @@ func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sou
+ 	//nolint:staticcheck
+ 	metadata.Source = source
+ 	metadata.Destination = destination.Unwrap()
+-	if userName, _ := auth.UserFromContext[string](ctx); userName != "" {
++	userName, _ := auth.UserFromContext[string](ctx)
++	if !(*Inbound)(h).isUserAllowed(userName) {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
++	if userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
+ 	} else {
+diff --git a/protocol/hysteria2/inbound.go b/protocol/hysteria2/inbound.go
+index ef9233f..77a7c42 100644
+--- a/protocol/hysteria2/inbound.go
++++ b/protocol/hysteria2/inbound.go
+@@ -8,6 +8,7 @@ import (
+ 	"net/netip"
+ 	"net/url"
+ 	"os"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -34,14 +35,19 @@ func RegisterInbound(registry *inbound.Registry) {
+ 	inbound.Register[option.Hysteria2InboundOptions](registry, C.TypeHysteria2, NewInbound)
+ }
+ 
++var _ adapter.InboundUserUpdater = (*Inbound)(nil)
++
+ type Inbound struct {
+ 	inbound.Adapter
+-	router       adapter.Router
+-	logger       log.ContextLogger
+-	listener     *listener.Listener
+-	tlsConfig    tls.ServerConfig
+-	service      *hysteria2.Service[int]
+-	userNameList []string
++	router        adapter.Router
++	logger        log.ContextLogger
++	listener      *listener.Listener
++	tlsConfig     tls.ServerConfig
++	service       *hysteria2.Service[int]
++	userAccess    sync.RWMutex
++	userNameList  []string
++	userNameIndex map[string]int
++	allowedIDs    map[int]bool
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
+@@ -206,20 +212,73 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	userList := make([]int, 0, len(options.Users))
+-	userNameList := make([]string, 0, len(options.Users))
+-	userPasswordList := make([]string, 0, len(options.Users))
+-	for index, user := range options.Users {
+-		userList = append(userList, index)
+-		userNameList = append(userNameList, user.Name)
+-		userPasswordList = append(userPasswordList, user.Password)
+-	}
+-	hysteriaService.UpdateUsers(userList, userPasswordList)
+ 	inbound.service = hysteriaService
+-	inbound.userNameList = userNameList
++	inbound.userNameIndex = make(map[string]int, len(options.Users))
++	inbound.applyUsers(options.Users)
+ 	return inbound, nil
+ }
+ 
++func (h *Inbound) applyUsers(users []option.Hysteria2User) {
++	h.userAccess.Lock()
++	if h.userNameIndex == nil {
++		h.userNameIndex = make(map[string]int, len(users))
++	}
++	userList := make([]int, 0, len(users))
++	userPasswordList := make([]string, 0, len(users))
++	allowedIDs := make(map[int]bool, len(users))
++	for _, user := range users {
++		var userID int
++		if user.Name != "" {
++			if existing, loaded := h.userNameIndex[user.Name]; loaded {
++				userID = existing
++			} else {
++				userID = len(h.userNameList)
++				h.userNameList = append(h.userNameList, user.Name)
++				h.userNameIndex[user.Name] = userID
++			}
++		} else {
++			userID = len(h.userNameList)
++			h.userNameList = append(h.userNameList, "")
++		}
++		userList = append(userList, userID)
++		userPasswordList = append(userPasswordList, user.Password)
++		allowedIDs[userID] = true
++	}
++	h.allowedIDs = allowedIDs
++	h.service.UpdateUsers(userList, userPasswordList)
++	h.userAccess.Unlock()
++}
++
++func (h *Inbound) UpdateInboundUsers(rawOptions any) error {
++	var users []option.Hysteria2User
++	switch opts := rawOptions.(type) {
++	case *option.Hysteria2InboundOptions:
++		if opts == nil {
++			return os.ErrInvalid
++		}
++		users = opts.Users
++	case option.Hysteria2InboundOptions:
++		users = opts.Users
++	default:
++		return os.ErrInvalid
++	}
++	h.applyUsers(users)
++	return nil
++}
++
++func (h *Inbound) resolveUser(ctx context.Context) (string, bool) {
++	userID, loaded := auth.UserFromContext[int](ctx)
++	h.userAccess.RLock()
++	defer h.userAccess.RUnlock()
++	if h.allowedIDs != nil && (!loaded || !h.allowedIDs[userID]) {
++		return "", false
++	}
++	if !loaded || userID < 0 || userID >= len(h.userNameList) {
++		return "", true
++	}
++	return h.userNameList[userID], true
++}
++
+ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+ 	ctx = log.ContextWithNewID(ctx)
+ 	var metadata adapter.InboundContext
+@@ -232,8 +291,12 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	userName, allowed := h.resolveUser(ctx)
++	if !allowed {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
++	if userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
+ 	} else {
+@@ -254,8 +317,12 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	userName, allowed := h.resolveUser(ctx)
++	if !allowed {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
++	if userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
+ 	} else {
+diff --git a/protocol/shadowsocks/inbound.go b/protocol/shadowsocks/inbound.go
+index 3fc9dc7..9992b8a 100644
+--- a/protocol/shadowsocks/inbound.go
++++ b/protocol/shadowsocks/inbound.go
+@@ -35,7 +35,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	} else if options.Managed && (len(options.Users) > 0 || len(options.Destinations) > 0) {
+ 		return nil, E.New("users and destinations options are not supported in managed servers")
+ 	}
+-	if len(options.Users) > 0 || options.Managed {
++	if options.Users != nil || options.Managed {
+ 		return newMultiInbound(ctx, router, logger, tag, options)
+ 	} else if len(options.Destinations) > 0 {
+ 		return newRelayInbound(ctx, router, logger, tag, options)
+diff --git a/protocol/shadowsocks/inbound_multi.go b/protocol/shadowsocks/inbound_multi.go
+index 706243e..db95563 100644
+--- a/protocol/shadowsocks/inbound_multi.go
++++ b/protocol/shadowsocks/inbound_multi.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"net"
+ 	"os"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -31,25 +32,33 @@ import (
+ var (
+ 	_ adapter.TCPInjectableInbound = (*MultiInbound)(nil)
+ 	_ adapter.ManagedSSMServer     = (*MultiInbound)(nil)
++	_ adapter.InboundUserUpdater   = (*MultiInbound)(nil)
+ )
+ 
+ type MultiInbound struct {
+ 	inbound.Adapter
+-	ctx      context.Context
+-	router   adapter.ConnectionRouterEx
+-	logger   logger.ContextLogger
+-	listener *listener.Listener
+-	service  shadowsocks.MultiService[int]
+-	users    []option.ShadowsocksUser
+-	tracker  adapter.SSMTracker
++	ctx        context.Context
++	router     adapter.ConnectionRouterEx
++	logger     logger.ContextLogger
++	listener   *listener.Listener
++	userAccess sync.RWMutex
++	method     string
++	password   string
++	udpTimeout time.Duration
++	service      shadowsocks.MultiService[int]
++	users        []option.ShadowsocksUser
++	allowedUsers map[string]bool
++	tracker      adapter.SSMTracker
+ }
+ 
+ func newMultiInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksInboundOptions) (*MultiInbound, error) {
+ 	inbound := &MultiInbound{
+-		Adapter: inbound.NewAdapter(C.TypeShadowsocks, tag),
+-		ctx:     ctx,
+-		router:  uot.NewRouter(router, logger),
+-		logger:  logger,
++		Adapter:  inbound.NewAdapter(C.TypeShadowsocks, tag),
++		ctx:      ctx,
++		router:   uot.NewRouter(router, logger),
++		logger:   logger,
++		method:   options.Method,
++		password: options.Password,
+ 	}
+ 	var err error
+ 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
+@@ -62,49 +71,73 @@ func newMultiInbound(ctx context.Context, router adapter.Router, logger log.Cont
+ 	} else {
+ 		udpTimeout = C.UDPTimeout
+ 	}
+-	var service shadowsocks.MultiService[int]
+-	if common.Contains(shadowaead_2022.List, options.Method) {
++	inbound.udpTimeout = udpTimeout
++	usersCopy := append([]option.ShadowsocksUser(nil), options.Users...)
++	service, err := inbound.buildService(usersCopy)
++	if err != nil {
++		return nil, err
++	}
++	inbound.service = service
++	inbound.users = usersCopy
++	inbound.listener = listener.New(listener.Options{
++		Context:                  ctx,
++		Logger:                   logger,
++		Network:                  options.Network.Build(),
++		Listen:                   options.ListenOptions,
++		ConnectionHandler:        inbound,
++		PacketHandler:            inbound,
++		ThreadUnsafePacketWriter: true,
++	})
++	return inbound, err
++}
++
++func (h *MultiInbound) buildService(users []option.ShadowsocksUser) (shadowsocks.MultiService[int], error) {
++	usersCopy := append([]option.ShadowsocksUser(nil), users...)
++	var (
++		service shadowsocks.MultiService[int]
++		err     error
++	)
++	handler := adapter.NewLegacyUpstreamHandler(
++		adapter.InboundContext{},
++		func(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
++			return h.newConnectionWithUsers(ctx, conn, metadata, usersCopy)
++		},
++		func(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
++			return h.newPacketConnectionWithUsers(ctx, conn, metadata, usersCopy)
++		},
++		h,
++	)
++	if common.Contains(shadowaead_2022.List, h.method) {
+ 		service, err = shadowaead_2022.NewMultiServiceWithPassword[int](
+-			options.Method,
+-			options.Password,
+-			int64(udpTimeout.Seconds()),
+-			adapter.NewLegacyUpstreamHandler(adapter.InboundContext{}, inbound.newConnection, inbound.newPacketConnection, inbound),
+-			ntp.TimeFuncFromContext(ctx),
++			h.method,
++			h.password,
++			int64(h.udpTimeout.Seconds()),
++			handler,
++			ntp.TimeFuncFromContext(h.ctx),
+ 		)
+-	} else if common.Contains(shadowaead.List, options.Method) {
++	} else if common.Contains(shadowaead.List, h.method) {
+ 		service, err = shadowaead.NewMultiService[int](
+-			options.Method,
+-			int64(udpTimeout.Seconds()),
+-			adapter.NewLegacyUpstreamHandler(adapter.InboundContext{}, inbound.newConnection, inbound.newPacketConnection, inbound),
++			h.method,
++			int64(h.udpTimeout.Seconds()),
++			handler,
+ 		)
+ 	} else {
+-		return nil, E.New("unsupported method: " + options.Method)
++		return nil, E.New("unsupported method: " + h.method)
+ 	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if len(options.Users) > 0 {
+-		err = service.UpdateUsersWithPasswords(common.MapIndexed(options.Users, func(index int, user option.ShadowsocksUser) int {
++	if len(usersCopy) > 0 {
++		err = service.UpdateUsersWithPasswords(common.MapIndexed(usersCopy, func(index int, user option.ShadowsocksUser) int {
+ 			return index
+-		}), common.Map(options.Users, func(user option.ShadowsocksUser) string {
++		}), common.Map(usersCopy, func(user option.ShadowsocksUser) string {
+ 			return user.Password
+ 		}))
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 	}
+-	inbound.service = service
+-	inbound.users = options.Users
+-	inbound.listener = listener.New(listener.Options{
+-		Context:                  ctx,
+-		Logger:                   logger,
+-		Network:                  options.Network.Build(),
+-		Listen:                   options.ListenOptions,
+-		ConnectionHandler:        inbound,
+-		PacketHandler:            inbound,
+-		ThreadUnsafePacketWriter: true,
+-	})
+-	return inbound, err
++	return service, nil
+ }
+ 
+ func (h *MultiInbound) Start(stage adapter.StartStage) error {
+@@ -123,23 +156,72 @@ func (h *MultiInbound) SetTracker(tracker adapter.SSMTracker) {
+ }
+ 
+ func (h *MultiInbound) UpdateUsers(users []string, uPSKs []string) error {
+-	err := h.service.UpdateUsersWithPasswords(common.MapIndexed(users, func(index int, user string) int {
+-		return index
+-	}), uPSKs)
++	if len(users) != len(uPSKs) {
++		return os.ErrInvalid
++	}
++	userList := make([]option.ShadowsocksUser, len(users))
++	for i := range users {
++		userList[i] = option.ShadowsocksUser{
++			Name:     users[i],
++			Password: uPSKs[i],
++		}
++	}
++	service, err := h.buildService(userList)
+ 	if err != nil {
+ 		return err
+ 	}
+-	h.users = common.Map(users, func(user string) option.ShadowsocksUser {
+-		return option.ShadowsocksUser{
+-			Name: user,
++	h.userAccess.Lock()
++	h.users = userList
++	h.service = service
++	h.userAccess.Unlock()
++	return nil
++}
++
++func (h *MultiInbound) UpdateInboundUsers(rawOptions any) error {
++	var users []option.ShadowsocksUser
++	switch opts := rawOptions.(type) {
++	case *option.ShadowsocksInboundOptions:
++		if opts == nil {
++			return os.ErrInvalid
+ 		}
+-	})
++		users = opts.Users
++	case option.ShadowsocksInboundOptions:
++		users = opts.Users
++	default:
++		return os.ErrInvalid
++	}
++	usersCopy := append([]option.ShadowsocksUser(nil), users...)
++	service, err := h.buildService(usersCopy)
++	if err != nil {
++		return err
++	}
++	allowedUsers := make(map[string]bool, len(usersCopy))
++	for _, u := range usersCopy {
++		if u.Name != "" {
++			allowedUsers[u.Name] = true
++		}
++	}
++	h.userAccess.Lock()
++	h.users = usersCopy
++	h.allowedUsers = allowedUsers
++	h.service = service
++	h.userAccess.Unlock()
+ 	return nil
+ }
+ 
++func (h *MultiInbound) isUserAllowed(user string) bool {
++	h.userAccess.RLock()
++	allowed := h.allowedUsers == nil || h.allowedUsers[user]
++	h.userAccess.RUnlock()
++	return allowed
++}
++
+ //nolint:staticcheck
+ func (h *MultiInbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+-	err := h.service.NewConnection(ctx, conn, adapter.UpstreamMetadata(metadata))
++	h.userAccess.RLock()
++	service := h.service
++	h.userAccess.RUnlock()
++	err := service.NewConnection(ctx, conn, adapter.UpstreamMetadata(metadata))
+ 	N.CloseOnHandshakeFailure(conn, onClose, err)
+ 	if err != nil {
+ 		if E.IsClosedOrCanceled(err) {
+@@ -152,18 +234,24 @@ func (h *MultiInbound) NewConnection(ctx context.Context, conn net.Conn, metadat
+ 
+ //nolint:staticcheck
+ func (h *MultiInbound) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
+-	err := h.service.NewPacket(h.ctx, &stubPacketConn{h.listener.PacketWriter()}, buffer, M.Metadata{Source: source})
++	h.userAccess.RLock()
++	service := h.service
++	h.userAccess.RUnlock()
++	err := service.NewPacket(h.ctx, &stubPacketConn{h.listener.PacketWriter()}, buffer, M.Metadata{Source: source})
+ 	if err != nil {
+ 		h.logger.Error(E.Cause(err, "process packet from ", source))
+ 	}
+ }
+ 
+-func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
++func (h *MultiInbound) newConnectionWithUsers(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, users []option.ShadowsocksUser) error {
+ 	userIndex, loaded := auth.UserFromContext[int](ctx)
+-	if !loaded {
++	if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 		return os.ErrInvalid
+ 	}
+-	user := h.users[userIndex].Name
++	user := users[userIndex].Name
++	if !h.isUserAllowed(user) {
++		return os.ErrPermission
++	}
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+@@ -181,12 +269,15 @@ func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadat
+ 	return h.router.RouteConnection(ctx, conn, metadata)
+ }
+ 
+-func (h *MultiInbound) newPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
++func (h *MultiInbound) newPacketConnectionWithUsers(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, users []option.ShadowsocksUser) error {
+ 	userIndex, loaded := auth.UserFromContext[int](ctx)
+-	if !loaded {
++	if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 		return os.ErrInvalid
+ 	}
+-	user := h.users[userIndex].Name
++	user := users[userIndex].Name
++	if !h.isUserAllowed(user) {
++		return os.ErrPermission
++	}
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+diff --git a/protocol/shadowtls/inbound.go b/protocol/shadowtls/inbound.go
+index abc3b8b..e9a364c 100644
+--- a/protocol/shadowtls/inbound.go
++++ b/protocol/shadowtls/inbound.go
+@@ -3,6 +3,8 @@ package shadowtls
+ import (
+ 	"context"
+ 	"net"
++	"os"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -24,12 +26,16 @@ func RegisterInbound(registry *inbound.Registry) {
+ 	inbound.Register[option.ShadowTLSInboundOptions](registry, C.TypeShadowTLS, NewInbound)
+ }
+ 
++var _ adapter.InboundUserUpdater = (*Inbound)(nil)
++
+ type Inbound struct {
+ 	inbound.Adapter
+-	router   adapter.Router
+-	logger   logger.ContextLogger
+-	listener *listener.Listener
+-	service  *shadowtls.Service
++	router        adapter.Router
++	logger        logger.ContextLogger
++	listener      *listener.Listener
++	userAccess    sync.RWMutex
++	serviceConfig shadowtls.ServiceConfig
++	service       *shadowtls.Service
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowTLSInboundOptions) (adapter.Inbound, error) {
+@@ -67,7 +73,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	service, err := shadowtls.NewService(shadowtls.ServiceConfig{
++	inbound.serviceConfig = shadowtls.ServiceConfig{
+ 		Version:  options.Version,
+ 		Password: options.Password,
+ 		Users: common.Map(options.Users, func(it option.ShadowTLSUser) shadowtls.User {
+@@ -82,7 +88,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		WildcardSNI:            shadowtls.WildcardSNI(options.WildcardSNI),
+ 		Handler:                (*inboundHandler)(inbound),
+ 		Logger:                 logger,
+-	})
++	}
++	service, err := shadowtls.NewService(inbound.serviceConfig)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -97,6 +104,42 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	return inbound, nil
+ }
+ 
++func (h *Inbound) UpdateInboundUsers(rawOptions any) error {
++	var users []option.ShadowTLSUser
++	switch opts := rawOptions.(type) {
++	case *option.ShadowTLSInboundOptions:
++		if opts == nil {
++			return os.ErrInvalid
++		}
++		users = opts.Users
++	case option.ShadowTLSInboundOptions:
++		users = opts.Users
++	default:
++		return os.ErrInvalid
++	}
++	cfg := h.serviceConfig
++	cfg.Users = common.Map(users, func(it option.ShadowTLSUser) shadowtls.User {
++		return shadowtls.User(it)
++	})
++	var (
++		service *shadowtls.Service
++		err     error
++	)
++	if cfg.Version == 3 && len(cfg.Users) == 0 {
++		service = nil
++	} else {
++		service, err = shadowtls.NewService(cfg)
++		if err != nil {
++			return err
++		}
++	}
++	h.userAccess.Lock()
++	h.serviceConfig = cfg
++	h.service = service
++	h.userAccess.Unlock()
++	return nil
++}
++
+ func (h *Inbound) Start(stage adapter.StartStage) error {
+ 	if stage != adapter.StartStateStart {
+ 		return nil
+@@ -109,7 +152,15 @@ func (h *Inbound) Close() error {
+ }
+ 
+ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+-	err := h.service.NewConnection(adapter.WithContext(log.ContextWithNewID(ctx), &metadata), conn, metadata.Source, metadata.Destination, onClose)
++	h.userAccess.RLock()
++	service := h.service
++	h.userAccess.RUnlock()
++	var err error
++	if service == nil {
++		err = E.New("missing users")
++	} else {
++		err = service.NewConnection(adapter.WithContext(log.ContextWithNewID(ctx), &metadata), conn, metadata.Source, metadata.Destination, onClose)
++	}
+ 	N.CloseOnHandshakeFailure(conn, onClose, err)
+ 	if err != nil {
+ 		if E.IsClosedOrCanceled(err) {
+diff --git a/protocol/snell/inbound.go b/protocol/snell/inbound.go
+index 79ee4ed..f488717 100644
+--- a/protocol/snell/inbound.go
++++ b/protocol/snell/inbound.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"net"
+ 	"os"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -27,15 +28,21 @@ func RegisterInbound(registry *inbound.Registry) {
+ 	inbound.Register[option.SnellInboundOptions](registry, C.TypeSnell, NewInbound)
+ }
+ 
+-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
++var (
++	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
++	_ adapter.InboundUserUpdater   = (*Inbound)(nil)
++)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	router   adapter.ConnectionRouterEx
+-	logger   logger.ContextLogger
+-	listener *listener.Listener
+-	service  snellprotocol.Service
+-	users    []option.SnellUser
++	router     adapter.ConnectionRouterEx
++	logger     logger.ContextLogger
++	listener   *listener.Listener
++	userAccess   sync.RWMutex
++	options      option.SnellInboundOptions
++	service      snellprotocol.Service
++	users        []option.SnellUser
++	allowedUsers map[string]bool
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SnellInboundOptions) (adapter.Inbound, error) {
+@@ -43,85 +50,164 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		Adapter: inbound.NewAdapter(C.TypeSnell, tag),
+ 		router:  uot.NewRouter(router, logger),
+ 		logger:  logger,
+-		users:   options.Users,
++		options: options,
++		users:   append([]option.SnellUser(nil), options.Users...),
++	}
++	service, err := inbound.buildService(options)
++	if err != nil {
++		return nil, err
++	}
++	inbound.service = service
++	inbound.listener = listener.New(listener.Options{
++		Context:           ctx,
++		Logger:            logger,
++		Network:           []string{N.NetworkTCP},
++		Listen:            options.ListenOptions,
++		ConnectionHandler: inbound,
++	})
++	return inbound, nil
++}
++
++type snellUserHandler struct {
++	inbound *Inbound
++	users   []option.SnellUser
++}
++
++func (u *snellUserHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++	_, metadata := adapter.ExtendContext(ctx)
++	if source.IsValid() {
++		metadata.Source = source
++	}
++	if destination.IsValid() {
++		metadata.Destination = destination
++	}
++	u.inbound.newConnectionWithUsers(ctx, conn, *metadata, onClose, u.users)
++}
++
++func (u *snellUserHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++	_, metadata := adapter.ExtendContext(ctx)
++	if source.IsValid() {
++		metadata.Source = source
++	}
++	if destination.IsValid() {
++		metadata.Destination = destination
++	}
++	u.inbound.newPacketConnectionWithUsers(ctx, conn, *metadata, onClose, u.users)
++}
++
++func (h *Inbound) buildService(options option.SnellInboundOptions) (snellprotocol.Service, error) {
++	usersCopy := append([]option.SnellUser(nil), options.Users...)
++	options.Users = usersCopy
++	handler := &snellUserHandler{
++		inbound: h,
++		users:   usersCopy,
+ 	}
+ 	var userList []int
+ 	var keyList [][]byte
+-	if len(options.Users) > 0 {
+-		userList = make([]int, len(options.Users))
+-		keyList = make([][]byte, len(options.Users))
+-		for index, user := range options.Users {
++	if len(usersCopy) > 0 {
++		userList = make([]int, len(usersCopy))
++		keyList = make([][]byte, len(usersCopy))
++		for index, user := range usersCopy {
+ 			userList[index] = index
+ 			keyList[index] = []byte(user.UserKey)
+ 		}
+ 	}
+-	var err error
+ 	if options.MultiUserPSK && options.Version != 5 {
+ 		return nil, E.New("snell: multi_user_psk requires version 5")
+ 	}
+ 	switch options.Version {
+ 	case 5:
+-		var obfsMode snellprotocol.ObfsMode
+-		obfsMode, err = snellprotocol.ParseObfsMode(options.ObfsOptions.ObfsMode)
++		obfsMode, err := snellprotocol.ParseObfsMode(options.ObfsOptions.ObfsMode)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		serviceOptions := snellv5.ServiceOptions{
+ 			PSK:      []byte(options.PSK),
+ 			ObfsMode: obfsMode,
+-			Handler:  inbound,
++			Handler:  handler,
+ 		}
+ 		if options.MultiUserPSK {
+-			inbound.service, err = newPSKService(options, inbound)
+-		} else if len(options.Users) > 0 {
+-			var service *snellv5.MultiService[int]
+-			service, err = snellv5.NewMultiService[int](serviceOptions)
++			return newPSKService(options, handler)
++		} else if len(usersCopy) > 0 {
++			service, err := snellv5.NewMultiService[int](serviceOptions)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			err = service.UpdateUsers(userList, keyList)
+-			inbound.service = service
+-		} else {
+-			inbound.service, err = snellv5.NewService(serviceOptions)
++			if err := service.UpdateUsers(userList, keyList); err != nil {
++				return nil, err
++			}
++			return service, nil
+ 		}
++		return snellv5.NewService(serviceOptions)
+ 	case 6:
+-		var mode snellv6.Mode
+-		mode, err = snellv6.ParseMode(options.V6Options.Mode)
++		mode, err := snellv6.ParseMode(options.V6Options.Mode)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		serviceOptions := snellv6.ServerOptions{
+ 			PSK:     []byte(options.PSK),
+ 			Mode:    mode,
+-			Handler: inbound,
++			Handler: handler,
+ 		}
+-		if len(options.Users) > 0 {
+-			var service *snellv6.MultiService[int]
+-			service, err = snellv6.NewMultiService[int](serviceOptions)
++		if len(usersCopy) > 0 {
++			service, err := snellv6.NewMultiService[int](serviceOptions)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			err = service.UpdateUsers(userList, keyList)
+-			inbound.service = service
+-		} else {
+-			inbound.service, err = snellv6.NewService(serviceOptions)
++			if err := service.UpdateUsers(userList, keyList); err != nil {
++				return nil, err
++			}
++			return service, nil
+ 		}
++		return snellv6.NewService(serviceOptions)
+ 	case 0:
+ 		return nil, E.New("snell: missing version")
+ 	default:
+ 		return nil, E.New("snell: unsupported version: ", options.Version)
+ 	}
++}
++
++func (h *Inbound) UpdateInboundUsers(rawOptions any) error {
++	var users []option.SnellUser
++	switch opts := rawOptions.(type) {
++	case *option.SnellInboundOptions:
++		if opts == nil {
++			return os.ErrInvalid
++		}
++		users = opts.Users
++	case option.SnellInboundOptions:
++		users = opts.Users
++	default:
++		return os.ErrInvalid
++	}
++	h.userAccess.RLock()
++	options := h.options
++	h.userAccess.RUnlock()
++	options.Users = append([]option.SnellUser(nil), users...)
++	service, err := h.buildService(options)
+ 	if err != nil {
+-		return nil, err
++		return err
+ 	}
+-	inbound.listener = listener.New(listener.Options{
+-		Context:           ctx,
+-		Logger:            logger,
+-		Network:           []string{N.NetworkTCP},
+-		Listen:            options.ListenOptions,
+-		ConnectionHandler: inbound,
+-	})
+-	return inbound, nil
++	allowedUsers := make(map[string]bool, len(options.Users))
++	for _, u := range options.Users {
++		if u.Name != "" {
++			allowedUsers[u.Name] = true
++		}
++	}
++	h.userAccess.Lock()
++	h.options = options
++	h.users = options.Users
++	h.allowedUsers = allowedUsers
++	h.service = service
++	h.userAccess.Unlock()
++	return nil
++}
++
++func (h *Inbound) isUserAllowed(user string) bool {
++	h.userAccess.RLock()
++	allowed := h.allowedUsers == nil || h.allowedUsers[user]
++	h.userAccess.RUnlock()
++	return allowed
+ }
+ 
+ func (h *Inbound) Start(stage adapter.StartStage) error {
+@@ -136,7 +222,10 @@ func (h *Inbound) Close() error {
+ }
+ 
+ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+-	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
++	h.userAccess.RLock()
++	service := h.service
++	h.userAccess.RUnlock()
++	err := service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		if E.IsClosedOrCanceled(err) {
+@@ -148,37 +237,33 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ }
+ 
+ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+-	_, metadata := adapter.ExtendContext(ctx)
+-	if source.IsValid() {
+-		metadata.Source = source
+-	}
+-	if destination.IsValid() {
+-		metadata.Destination = destination
+-	}
+-	h.newConnection(ctx, conn, *metadata, onClose)
++	h.userAccess.RLock()
++	users := h.users
++	h.userAccess.RUnlock()
++	(&snellUserHandler{inbound: h, users: users}).NewConnectionEx(ctx, conn, source, destination, onClose)
+ }
+ 
+ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+-	_, metadata := adapter.ExtendContext(ctx)
+-	if source.IsValid() {
+-		metadata.Source = source
+-	}
+-	if destination.IsValid() {
+-		metadata.Destination = destination
+-	}
+-	h.newPacketConnection(ctx, conn, *metadata, onClose)
++	h.userAccess.RLock()
++	users := h.users
++	h.userAccess.RUnlock()
++	(&snellUserHandler{inbound: h, users: users}).NewPacketConnectionEx(ctx, conn, source, destination, onClose)
+ }
+ 
+-func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++func (h *Inbound) newConnectionWithUsers(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, users []option.SnellUser) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	if len(h.users) > 0 {
++	if len(users) > 0 {
+ 		userIndex, loaded := auth.UserFromContext[int](ctx)
+-		if !loaded {
++		if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 			return
+ 		}
+-		user := h.users[userIndex].Name
++		user := users[userIndex].Name
++		if !h.isUserAllowed(user) {
++			N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++			return
++		}
+ 		if user == "" {
+ 			user = F.ToString(userIndex)
+ 		} else {
+@@ -191,18 +276,22 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
+ 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+ }
+ 
+-func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++func (h *Inbound) newPacketConnectionWithUsers(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, users []option.SnellUser) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	// The snell client in Surge rejects UDP responses with domain addresses.
+ 	metadata.UDPDisableDomainUnmapping = true
+-	if len(h.users) > 0 {
++	if len(users) > 0 {
+ 		userIndex, loaded := auth.UserFromContext[int](ctx)
+-		if !loaded {
++		if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 			return
+ 		}
+-		user := h.users[userIndex].Name
++		user := users[userIndex].Name
++		if !h.isUserAllowed(user) {
++			N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++			return
++		}
+ 		if user == "" {
+ 			user = F.ToString(userIndex)
+ 		} else {
+diff --git a/protocol/trojan/inbound.go b/protocol/trojan/inbound.go
+index 920589b..d9053a1 100644
+--- a/protocol/trojan/inbound.go
++++ b/protocol/trojan/inbound.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"net"
+ 	"os"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -27,15 +28,21 @@ func RegisterInbound(registry *inbound.Registry) {
+ 	inbound.Register[option.TrojanInboundOptions](registry, C.TypeTrojan, NewInbound)
+ }
+ 
+-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
++var (
++	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
++	_ adapter.InboundUserUpdater   = (*Inbound)(nil)
++)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+ 	router                   adapter.ConnectionRouterEx
+ 	logger                   log.ContextLogger
+ 	listener                 *listener.Listener
++	userAccess               sync.RWMutex
++	fallbackHandler          N.TCPConnectionHandlerEx
+ 	service                  *trojan.Service[int]
+ 	users                    []option.TrojanUser
++	allowedUsers             map[string]bool
+ 	tlsConfig                tls.ServerConfig
+ 	fallbackAddr             M.Socksaddr
+ 	fallbackAddrTLSNextProto map[string]M.Socksaddr
+@@ -47,7 +54,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		Adapter: inbound.NewAdapter(C.TypeTrojan, tag),
+ 		router:  router,
+ 		logger:  logger,
+-		users:   options.Users,
++		users:   append([]option.TrojanUser(nil), options.Users...),
+ 	}
+ 	if options.TLS != nil {
+ 		tlsConfig, err := tls.NewServerWithOptions(tls.ServerOptions{
+@@ -86,12 +93,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		}
+ 		fallbackHandler = adapter.NewUpstreamContextHandler(inbound.fallbackConnection, nil)
+ 	}
+-	service := trojan.NewService[int](adapter.NewUpstreamContextHandler(inbound.newConnection, inbound.newPacketConnection), fallbackHandler, logger)
+-	err := service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.TrojanUser) int {
+-		return index
+-	}), common.Map(options.Users, func(it option.TrojanUser) string {
+-		return it.Password
+-	}))
++	inbound.fallbackHandler = fallbackHandler
++	service, err := inbound.buildService(inbound.users)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -116,6 +119,66 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	return inbound, nil
+ }
+ 
++func (h *Inbound) buildService(users []option.TrojanUser) (*trojan.Service[int], error) {
++	usersCopy := append([]option.TrojanUser(nil), users...)
++	service := trojan.NewService[int](adapter.NewUpstreamContextHandler(
++		func(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++			h.newConnectionWithUsers(ctx, conn, metadata, onClose, usersCopy)
++		},
++		func(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++			h.newPacketConnectionWithUsers(ctx, conn, metadata, onClose, usersCopy)
++		},
++	), h.fallbackHandler, h.logger)
++	err := service.UpdateUsers(common.MapIndexed(usersCopy, func(index int, it option.TrojanUser) int {
++		return index
++	}), common.Map(usersCopy, func(it option.TrojanUser) string {
++		return it.Password
++	}))
++	if err != nil {
++		return nil, err
++	}
++	return service, nil
++}
++
++func (h *Inbound) UpdateInboundUsers(rawOptions any) error {
++	var users []option.TrojanUser
++	switch opts := rawOptions.(type) {
++	case *option.TrojanInboundOptions:
++		if opts == nil {
++			return os.ErrInvalid
++		}
++		users = opts.Users
++	case option.TrojanInboundOptions:
++		users = opts.Users
++	default:
++		return os.ErrInvalid
++	}
++	usersCopy := append([]option.TrojanUser(nil), users...)
++	service, err := h.buildService(usersCopy)
++	if err != nil {
++		return err
++	}
++	allowedUsers := make(map[string]bool, len(usersCopy))
++	for _, u := range usersCopy {
++		if u.Name != "" {
++			allowedUsers[u.Name] = true
++		}
++	}
++	h.userAccess.Lock()
++	h.users = usersCopy
++	h.allowedUsers = allowedUsers
++	h.service = service
++	h.userAccess.Unlock()
++	return nil
++}
++
++func (h *Inbound) isUserAllowed(user string) bool {
++	h.userAccess.RLock()
++	allowed := h.allowedUsers == nil || h.allowedUsers[user]
++	h.userAccess.RUnlock()
++	return allowed
++}
++
+ func (h *Inbound) Start(stage adapter.StartStage) error {
+ 	if stage != adapter.StartStateStart {
+ 		return nil
+@@ -174,22 +237,29 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ 		}
+ 		conn = tlsConn
+ 	}
+-	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
++	h.userAccess.RLock()
++	service := h.service
++	h.userAccess.RUnlock()
++	err := service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+ 	}
+ }
+ 
+-func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++func (h *Inbound) newConnectionWithUsers(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, users []option.TrojanUser) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	userIndex, loaded := auth.UserFromContext[int](ctx)
+-	if !loaded {
++	if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := users[userIndex].Name
++	if !h.isUserAllowed(user) {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+@@ -199,15 +269,19 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
+ 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+ }
+ 
+-func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++func (h *Inbound) newPacketConnectionWithUsers(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, users []option.TrojanUser) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	userIndex, loaded := auth.UserFromContext[int](ctx)
+-	if !loaded {
++	if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := users[userIndex].Name
++	if !h.isUserAllowed(user) {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+diff --git a/protocol/tuic/inbound.go b/protocol/tuic/inbound.go
+index 531d426..12f9083 100644
+--- a/protocol/tuic/inbound.go
++++ b/protocol/tuic/inbound.go
+@@ -3,6 +3,8 @@ package tuic
+ import (
+ 	"context"
+ 	"net"
++	"os"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -28,14 +30,19 @@ func RegisterInbound(registry *inbound.Registry) {
+ 	inbound.Register[option.TUICInboundOptions](registry, C.TypeTUIC, NewInbound)
+ }
+ 
++var _ adapter.InboundUserUpdater = (*Inbound)(nil)
++
+ type Inbound struct {
+ 	inbound.Adapter
+-	router       adapter.ConnectionRouterEx
+-	logger       log.ContextLogger
+-	listener     *listener.Listener
+-	tlsConfig    tls.ServerConfig
+-	server       *tuic.Service[int]
+-	userNameList []string
++	router        adapter.ConnectionRouterEx
++	logger        log.ContextLogger
++	listener      *listener.Listener
++	tlsConfig     tls.ServerConfig
++	server        *tuic.Service[int]
++	userAccess    sync.RWMutex
++	userNameList  []string
++	userNameIndex map[string]int
++	allowedIDs    map[int]bool
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TUICInboundOptions) (adapter.Inbound, error) {
+@@ -87,27 +94,84 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	var userList []int
+-	var userNameList []string
++	inbound.server = service
++	inbound.userNameIndex = make(map[string]int, len(options.Users))
++	if err := inbound.applyUsers(options.Users); err != nil {
++		return nil, err
++	}
++	return inbound, nil
++}
++
++func (h *Inbound) applyUsers(users []option.TUICUser) error {
+ 	var userUUIDList [][16]byte
+ 	var userPasswordList []string
+-	for index, user := range options.Users {
++	for index, user := range users {
+ 		if user.UUID == "" {
+-			return nil, E.New("missing uuid for user ", index)
++			return E.New("missing uuid for user ", index)
+ 		}
+ 		userUUID, err := uuid.FromString(user.UUID)
+ 		if err != nil {
+-			return nil, E.Cause(err, "invalid uuid for user ", index)
++			return E.Cause(err, "invalid uuid for user ", index)
+ 		}
+-		userList = append(userList, index)
+-		userNameList = append(userNameList, user.Name)
+ 		userUUIDList = append(userUUIDList, userUUID)
+ 		userPasswordList = append(userPasswordList, user.Password)
+ 	}
+-	service.UpdateUsers(userList, userUUIDList, userPasswordList)
+-	inbound.server = service
+-	inbound.userNameList = userNameList
+-	return inbound, nil
++	h.userAccess.Lock()
++	if h.userNameIndex == nil {
++		h.userNameIndex = make(map[string]int, len(users))
++	}
++	userList := make([]int, 0, len(users))
++	allowedIDs := make(map[int]bool, len(users))
++	for _, user := range users {
++		var userID int
++		if user.Name != "" {
++			if existing, loaded := h.userNameIndex[user.Name]; loaded {
++				userID = existing
++			} else {
++				userID = len(h.userNameList)
++				h.userNameList = append(h.userNameList, user.Name)
++				h.userNameIndex[user.Name] = userID
++			}
++		} else {
++			userID = len(h.userNameList)
++			h.userNameList = append(h.userNameList, "")
++		}
++		userList = append(userList, userID)
++		allowedIDs[userID] = true
++	}
++	h.allowedIDs = allowedIDs
++	h.server.UpdateUsers(userList, userUUIDList, userPasswordList)
++	h.userAccess.Unlock()
++	return nil
++}
++
++func (h *Inbound) UpdateInboundUsers(rawOptions any) error {
++	var users []option.TUICUser
++	switch opts := rawOptions.(type) {
++	case *option.TUICInboundOptions:
++		if opts == nil {
++			return os.ErrInvalid
++		}
++		users = opts.Users
++	case option.TUICInboundOptions:
++		users = opts.Users
++	default:
++		return os.ErrInvalid
++	}
++	return h.applyUsers(users)
++}
++
++func (h *Inbound) resolveUser(ctx context.Context) (string, bool) {
++	userID, loaded := auth.UserFromContext[int](ctx)
++	h.userAccess.RLock()
++	defer h.userAccess.RUnlock()
++	if h.allowedIDs != nil && (!loaded || !h.allowedIDs[userID]) {
++		return "", false
++	}
++	if !loaded || userID < 0 || userID >= len(h.userNameList) {
++		return "", true
++	}
++	return h.userNameList[userID], true
+ }
+ 
+ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+@@ -122,8 +186,12 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	userName, allowed := h.resolveUser(ctx)
++	if !allowed {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
++	if userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
+ 	} else {
+@@ -144,8 +212,12 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	userName, allowed := h.resolveUser(ctx)
++	if !allowed {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
++	if userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
+ 	} else {
+diff --git a/protocol/vless/inbound.go b/protocol/vless/inbound.go
+index 1589bfb..42b3631 100644
+--- a/protocol/vless/inbound.go
++++ b/protocol/vless/inbound.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"net"
+ 	"os"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -31,18 +32,23 @@ func RegisterInbound(registry *inbound.Registry) {
+ 	inbound.Register[option.VLESSInboundOptions](registry, C.TypeVLESS, NewInbound)
+ }
+ 
+-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
++var (
++	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
++	_ adapter.InboundUserUpdater   = (*Inbound)(nil)
++)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	ctx       context.Context
+-	router    adapter.ConnectionRouterEx
+-	logger    logger.ContextLogger
+-	listener  *listener.Listener
+-	users     []option.VLESSUser
+-	service   *vless.Service[int]
+-	tlsConfig tls.ServerConfig
+-	transport adapter.V2RayServerTransport
++	ctx        context.Context
++	router     adapter.ConnectionRouterEx
++	logger     logger.ContextLogger
++	listener   *listener.Listener
++	userAccess   sync.RWMutex
++	users        []option.VLESSUser
++	allowedUsers map[string]bool
++	service      *vless.Service[int]
++	tlsConfig  tls.ServerConfig
++	transport  adapter.V2RayServerTransport
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSInboundOptions) (adapter.Inbound, error) {
+@@ -51,22 +57,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		ctx:     ctx,
+ 		router:  uot.NewRouter(router, logger),
+ 		logger:  logger,
+-		users:   options.Users,
++		users:   append([]option.VLESSUser(nil), options.Users...),
+ 	}
+ 	var err error
+ 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	service := vless.NewService[int](logger, adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx))
+-	service.UpdateUsers(common.MapIndexed(inbound.users, func(index int, _ option.VLESSUser) int {
+-		return index
+-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
+-		return it.UUID
+-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
+-		return it.Flow
+-	}))
+-	inbound.service = service
++	inbound.service = inbound.buildService(inbound.users)
+ 	if options.TLS != nil {
+ 		inbound.tlsConfig, err = tls.NewServerWithOptions(tls.ServerOptions{
+ 			Context: ctx,
+@@ -98,6 +96,62 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	return inbound, nil
+ }
+ 
++func (h *Inbound) buildService(users []option.VLESSUser) *vless.Service[int] {
++	usersCopy := append([]option.VLESSUser(nil), users...)
++	service := vless.NewService[int](h.logger, adapter.NewUpstreamContextHandler(
++		func(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++			h.newConnectionExWithUsers(ctx, conn, metadata, onClose, usersCopy)
++		},
++		func(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++			h.newPacketConnectionExWithUsers(ctx, conn, metadata, onClose, usersCopy)
++		},
++	))
++	service.UpdateUsers(common.MapIndexed(usersCopy, func(index int, _ option.VLESSUser) int {
++		return index
++	}), common.Map(usersCopy, func(it option.VLESSUser) string {
++		return it.UUID
++	}), common.Map(usersCopy, func(it option.VLESSUser) string {
++		return it.Flow
++	}))
++	return service
++}
++
++func (h *Inbound) UpdateInboundUsers(rawOptions any) error {
++	var users []option.VLESSUser
++	switch opts := rawOptions.(type) {
++	case *option.VLESSInboundOptions:
++		if opts == nil {
++			return os.ErrInvalid
++		}
++		users = opts.Users
++	case option.VLESSInboundOptions:
++		users = opts.Users
++	default:
++		return os.ErrInvalid
++	}
++	usersCopy := append([]option.VLESSUser(nil), users...)
++	service := h.buildService(usersCopy)
++	allowedUsers := make(map[string]bool, len(usersCopy))
++	for _, u := range usersCopy {
++		if u.Name != "" {
++			allowedUsers[u.Name] = true
++		}
++	}
++	h.userAccess.Lock()
++	h.users = usersCopy
++	h.allowedUsers = allowedUsers
++	h.service = service
++	h.userAccess.Unlock()
++	return nil
++}
++
++func (h *Inbound) isUserAllowed(user string) bool {
++	h.userAccess.RLock()
++	allowed := h.allowedUsers == nil || h.allowedUsers[user]
++	h.userAccess.RUnlock()
++	return allowed
++}
++
+ func (h *Inbound) Start(stage adapter.StartStage) error {
+ 	if stage != adapter.StartStateStart {
+ 		return nil
+@@ -139,8 +193,11 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
+ }
+ 
+ func (h *Inbound) Close() error {
++	h.userAccess.RLock()
++	service := h.service
++	h.userAccess.RUnlock()
+ 	return common.Close(
+-		h.service,
++		service,
+ 		h.listener,
+ 		h.tlsConfig,
+ 		h.transport,
+@@ -157,22 +214,29 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ 		}
+ 		conn = tlsConn
+ 	}
+-	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
++	h.userAccess.RLock()
++	service := h.service
++	h.userAccess.RUnlock()
++	err := service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+ 	}
+ }
+ 
+-func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++func (h *Inbound) newConnectionExWithUsers(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, users []option.VLESSUser) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	userIndex, loaded := auth.UserFromContext[int](ctx)
+-	if !loaded {
++	if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := users[userIndex].Name
++	if !h.isUserAllowed(user) {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+@@ -182,15 +246,19 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
+ 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+ }
+ 
+-func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++func (h *Inbound) newPacketConnectionExWithUsers(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, users []option.VLESSUser) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	userIndex, loaded := auth.UserFromContext[int](ctx)
+-	if !loaded {
++	if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := users[userIndex].Name
++	if !h.isUserAllowed(user) {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+diff --git a/protocol/vmess/inbound.go b/protocol/vmess/inbound.go
+index 8783d3e..5392bc8 100644
+--- a/protocol/vmess/inbound.go
++++ b/protocol/vmess/inbound.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"net"
+ 	"os"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -32,18 +33,25 @@ func RegisterInbound(registry *inbound.Registry) {
+ 	inbound.Register[option.VMessInboundOptions](registry, C.TypeVMess, NewInbound)
+ }
+ 
+-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
++var (
++	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
++	_ adapter.InboundUserUpdater   = (*Inbound)(nil)
++)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	ctx       context.Context
+-	router    adapter.ConnectionRouterEx
+-	logger    logger.ContextLogger
+-	listener  *listener.Listener
+-	service   *vmess.Service[int]
+-	users     []option.VMessUser
+-	tlsConfig tls.ServerConfig
+-	transport adapter.V2RayServerTransport
++	ctx            context.Context
++	router         adapter.ConnectionRouterEx
++	logger         logger.ContextLogger
++	listener       *listener.Listener
++	userAccess     sync.RWMutex
++	serviceOptions []vmess.ServiceOption
++	started        bool
++	service        *vmess.Service[int]
++	users          []option.VMessUser
++	allowedUsers   map[string]bool
++	tlsConfig      tls.ServerConfig
++	transport      adapter.V2RayServerTransport
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VMessInboundOptions) (adapter.Inbound, error) {
+@@ -52,7 +60,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		ctx:     ctx,
+ 		router:  uot.NewRouter(router, logger),
+ 		logger:  logger,
+-		users:   options.Users,
++		users:   append([]option.VMessUser(nil), options.Users...),
+ 	}
+ 	var err error
+ 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
+@@ -66,18 +74,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if options.Transport != nil && options.Transport.Type != "" {
+ 		serviceOptions = append(serviceOptions, vmess.ServiceWithDisableHeaderProtection())
+ 	}
+-	service := vmess.NewService[int](adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
+-	inbound.service = service
+-	err = service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.VMessUser) int {
+-		return index
+-	}), common.Map(options.Users, func(it option.VMessUser) string {
+-		return it.UUID
+-	}), common.Map(options.Users, func(it option.VMessUser) int {
+-		return it.AlterId
+-	}))
++	inbound.serviceOptions = serviceOptions
++	service, err := inbound.buildService(inbound.users)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	inbound.service = service
+ 	if options.TLS != nil {
+ 		inbound.tlsConfig, err = tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
+ 		if err != nil {
+@@ -100,11 +102,88 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	return inbound, nil
+ }
+ 
++func (h *Inbound) buildService(users []option.VMessUser) (*vmess.Service[int], error) {
++	usersCopy := append([]option.VMessUser(nil), users...)
++	service := vmess.NewService[int](adapter.NewUpstreamContextHandler(
++		func(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++			h.newConnectionExWithUsers(ctx, conn, metadata, onClose, usersCopy)
++		},
++		func(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++			h.newPacketConnectionExWithUsers(ctx, conn, metadata, onClose, usersCopy)
++		},
++	), h.serviceOptions...)
++	err := service.UpdateUsers(common.MapIndexed(usersCopy, func(index int, it option.VMessUser) int {
++		return index
++	}), common.Map(usersCopy, func(it option.VMessUser) string {
++		return it.UUID
++	}), common.Map(usersCopy, func(it option.VMessUser) int {
++		return it.AlterId
++	}))
++	if err != nil {
++		return nil, err
++	}
++	return service, nil
++}
++
++func (h *Inbound) UpdateInboundUsers(rawOptions any) error {
++	var users []option.VMessUser
++	switch opts := rawOptions.(type) {
++	case *option.VMessInboundOptions:
++		if opts == nil {
++			return os.ErrInvalid
++		}
++		users = opts.Users
++	case option.VMessInboundOptions:
++		users = opts.Users
++	default:
++		return os.ErrInvalid
++	}
++	usersCopy := append([]option.VMessUser(nil), users...)
++	service, err := h.buildService(usersCopy)
++	if err != nil {
++		return err
++	}
++	h.userAccess.Lock()
++	if h.started {
++		if err := service.Start(); err != nil {
++			h.userAccess.Unlock()
++			return err
++		}
++	}
++	oldService := h.service
++	allowedUsers := make(map[string]bool, len(usersCopy))
++	for _, u := range usersCopy {
++		if u.Name != "" {
++			allowedUsers[u.Name] = true
++		}
++	}
++	h.users = usersCopy
++	h.allowedUsers = allowedUsers
++	h.service = service
++	h.userAccess.Unlock()
++	if oldService != nil {
++		_ = oldService.Close()
++	}
++	return nil
++}
++
++func (h *Inbound) isUserAllowed(user string) bool {
++	h.userAccess.RLock()
++	allowed := h.allowedUsers == nil || h.allowedUsers[user]
++	h.userAccess.RUnlock()
++	return allowed
++}
++
+ func (h *Inbound) Start(stage adapter.StartStage) error {
+ 	if stage != adapter.StartStateStart {
+ 		return nil
+ 	}
++	h.userAccess.Lock()
+ 	err := h.service.Start()
++	if err == nil {
++		h.started = true
++	}
++	h.userAccess.Unlock()
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -145,8 +224,12 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
+ }
+ 
+ func (h *Inbound) Close() error {
++	h.userAccess.Lock()
++	h.started = false
++	service := h.service
++	h.userAccess.Unlock()
+ 	return common.Close(
+-		h.service,
++		service,
+ 		h.listener,
+ 		h.tlsConfig,
+ 		h.transport,
+@@ -163,22 +246,29 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ 		}
+ 		conn = tlsConn
+ 	}
+-	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
++	h.userAccess.RLock()
++	service := h.service
++	h.userAccess.RUnlock()
++	err := service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+ 	}
+ }
+ 
+-func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++func (h *Inbound) newConnectionExWithUsers(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, users []option.VMessUser) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	userIndex, loaded := auth.UserFromContext[int](ctx)
+-	if !loaded {
++	if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := users[userIndex].Name
++	if !h.isUserAllowed(user) {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+@@ -188,15 +278,19 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
+ 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+ }
+ 
+-func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++func (h *Inbound) newPacketConnectionExWithUsers(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, users []option.VMessUser) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+ 	userIndex, loaded := auth.UserFromContext[int](ctx)
+-	if !loaded {
++	if !loaded || userIndex < 0 || userIndex >= len(users) {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := users[userIndex].Name
++	if !h.isUserAllowed(user) {
++		N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
++		return
++	}
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {

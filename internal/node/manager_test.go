@@ -2,12 +2,17 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -715,5 +720,294 @@ func TestSingBoxUserConnectionStatsReturnEmpty(t *testing.T) {
 	online := manager.GetUserOnlineStatus(context.Background(), GetUserOnlineStatusRequest{Username: "2"})
 	if online["response"].(map[string]any)["isOnline"].(bool) {
 		t.Fatalf("expected sing-box user online status to be false")
+	}
+}
+
+func TestStartHotReloadsWhenOnlyInboundUsersChange(t *testing.T) {
+	var gotPayload singBoxHotReloadUsersPayload
+	var gotAuth string
+	hotReloadCalls := 0
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/configs/users" {
+			http.NotFound(w, r)
+			return
+		}
+		hotReloadCalls++
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","closedConnections":1}`))
+	}))
+	defer apiServer.Close()
+
+	_, portStr, err := net.SplitHostPort(apiServer.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiPort, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "sing-box.json")
+	lastGoodPath := filepath.Join(dir, "sing-box.last-good.json")
+	cfg := config.Config{
+		SingBoxConfigPath:   configPath,
+		SingBoxLastGoodPath: lastGoodPath,
+		SingBoxAPIPort:      apiPort,
+		SingBoxV2RayAPIPort: apiPort + 1,
+		InternalRESTToken:   "secret-rest-token",
+	}
+
+	initialRaw := map[string]any{
+		"inbounds": []any{
+			map[string]any{
+				"tag":         "in-vless",
+				"type":        "vless",
+				"listen":      "::",
+				"listen_port": 443,
+				"users": []any{
+					map[string]any{"name": "user-1", "uuid": "11111111-1111-1111-1111-111111111111"},
+				},
+			},
+			map[string]any{
+				"tag":         "in-anytls",
+				"type":        "anytls",
+				"listen":      "::",
+				"listen_port": 8443,
+				"users": []any{
+					map[string]any{"name": "user-1", "password": "pw-1"},
+				},
+			},
+		},
+		"outbounds": []any{
+			map[string]any{"tag": "direct", "type": "direct"},
+		},
+	}
+	initialApplied := applySingBoxAPIConfig(normalizeSingBoxKeys(cloneMap(initialRaw)), cfg)
+	initialBytes, err := json.MarshalIndent(initialApplied, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, initialBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.SetOnlineStatus(true)
+	runtimeState.SetSingBoxConfig(initialApplied)
+	runtimeState.SetLastHashes(state.StartHashes{
+		EmptyConfig: "base-hash",
+		Inbounds: []state.InboundHash{
+			{Tag: "in-vless", Hash: "h1", UsersCount: 1},
+			{Tag: "in-anytls", Hash: "h1", UsersCount: 1},
+		},
+	})
+
+	store, err := usagesnapshot.Open(filepath.Join(dir, "snapshots.db"), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Activate(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakeSupervisor := newFakeProcessSupervisor()
+	fakeSupervisor.states[singBoxProcessName] = supervisor.StateRunning
+	manager := &Manager{
+		cfg:                cfg,
+		state:              runtimeState,
+		logger:             logger,
+		supervisor:         fakeSupervisor,
+		network:            system.NewNetworkMonitor(logger),
+		singStats:          &fakeStatsClient{},
+		usageSnapshots:     store,
+		runCommand:         func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
+		healthTimeout:      50 * time.Millisecond,
+		healthPollInterval: time.Millisecond,
+	}
+
+	updatedRaw := cloneMap(initialRaw)
+	updatedInbounds := asMapSlice(updatedRaw["inbounds"])
+	updatedInbounds[0]["users"] = []any{
+		map[string]any{"name": "user-1", "uuid": "11111111-1111-1111-1111-111111111111"},
+		map[string]any{"name": "user-2", "uuid": "22222222-2222-2222-2222-222222222222"},
+	}
+	updatedInbounds[1]["users"] = []any{
+		map[string]any{"name": "user-2", "password": "pw-2"},
+	}
+	updatedRaw["inbounds"] = toAnySlice(updatedInbounds)
+
+	resp := manager.Start(context.Background(), StartRequest{
+		CoreType: string(state.CoreTypeSingBox),
+		Internals: startInternals{
+			ForceRestart: false,
+			Hashes: state.StartHashes{
+				EmptyConfig: "base-hash",
+				Inbounds: []state.InboundHash{
+					{Tag: "in-vless", Hash: "h2", UsersCount: 2},
+					{Tag: "in-anytls", Hash: "h2", UsersCount: 1},
+				},
+			},
+		},
+		SingBoxConfig: updatedRaw,
+	}, "127.0.0.1")
+
+	body := resp["response"].(map[string]any)
+	if body["isStarted"] != true || body["error"] != nil {
+		t.Fatalf("unexpected Start response: %#v", body)
+	}
+	configApply := body["configApply"].(map[string]any)
+	if configApply["status"] != "APPLIED" || configApply["activeHash"] != configApply["requestedHash"] {
+		t.Fatalf("unexpected configApply after hot-reload: %#v", configApply)
+	}
+	if hotReloadCalls != 1 {
+		t.Fatalf("hotReloadCalls = %d, want 1", hotReloadCalls)
+	}
+	if gotAuth != "Bearer secret-rest-token" {
+		t.Fatalf("gotAuth = %q, want Bearer secret-rest-token", gotAuth)
+	}
+	if len(fakeSupervisor.stops) != 0 || len(fakeSupervisor.starts) != 0 {
+		t.Fatalf("hot-reload must not stop or start sing-box: stops=%v starts=%v", fakeSupervisor.stops, fakeSupervisor.starts)
+	}
+	if manager.usageCoreRestarted {
+		t.Fatal("hot-reload must not mark usageCoreRestarted")
+	}
+	if len(gotPayload.Inbounds) != 2 {
+		t.Fatalf("gotPayload.Inbounds len = %d, want 2", len(gotPayload.Inbounds))
+	}
+	if !slices.Contains(gotPayload.StatsUsers, statname.UserInbound("user-2", "in-vless")) || !slices.Contains(gotPayload.StatsUsers, statname.UserInbound("user-2", "in-anytls")) {
+		t.Fatalf("unexpected statsUsers in hot-reload payload: %#v", gotPayload.StatsUsers)
+	}
+	if got := len(runtimeState.InboundUsers("in-vless")); got != 2 {
+		t.Fatalf("runtime in-vless users = %d, want 2", got)
+	}
+	if got := len(runtimeState.InboundUsers("in-anytls")); got != 1 || runtimeState.InboundUsers("in-anytls")[0].UserID != "user-2" {
+		t.Fatalf("runtime in-anytls users = %#v, want [user-2]", runtimeState.InboundUsers("in-anytls"))
+	}
+
+	// Verify non-user config change or ForceRestart performs a full restart.
+	portChangedRaw := cloneMap(updatedRaw)
+	portChangedInbounds := asMapSlice(portChangedRaw["inbounds"])
+	portChangedInbounds[0]["listen_port"] = 2053
+	portChangedRaw["inbounds"] = toAnySlice(portChangedInbounds)
+	_ = manager.Start(context.Background(), StartRequest{
+		CoreType: string(state.CoreTypeSingBox),
+		Internals: startInternals{
+			ForceRestart: false,
+			Hashes: state.StartHashes{
+				EmptyConfig: "new-base-hash",
+				Inbounds: []state.InboundHash{
+					{Tag: "in-vless", Hash: "h2", UsersCount: 2},
+					{Tag: "in-anytls", Hash: "h2", UsersCount: 1},
+				},
+			},
+		},
+		SingBoxConfig: portChangedRaw,
+	}, "127.0.0.1")
+	if hotReloadCalls != 1 {
+		t.Fatalf("port change must not use user hot-reload, got hotReloadCalls=%d", hotReloadCalls)
+	}
+	if len(fakeSupervisor.stops) != 1 || len(fakeSupervisor.starts) != 1 {
+		t.Fatalf("port change must restart sing-box: stops=%v starts=%v", fakeSupervisor.stops, fakeSupervisor.starts)
+	}
+}
+
+func TestAddAndRemoveUserHotReloadWithoutRestartAndFallbackOnError(t *testing.T) {
+	failHotReload := false
+	hotReloadCalls := 0
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/configs/users" {
+			http.NotFound(w, r)
+			return
+		}
+		hotReloadCalls++
+		if failHotReload {
+			http.Error(w, `{"message":"simulated failure"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","closedConnections":0}`))
+	}))
+	defer apiServer.Close()
+
+	_, portStr, err := net.SplitHostPort(apiServer.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiPort, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "sing-box.json")
+	lastGoodPath := filepath.Join(dir, "sing-box.last-good.json")
+	cfg := config.Config{
+		SingBoxConfigPath:   configPath,
+		SingBoxLastGoodPath: lastGoodPath,
+		SingBoxAPIPort:      apiPort,
+		SingBoxV2RayAPIPort: apiPort + 1,
+	}
+
+	initialConfig := applySingBoxAPIConfig(map[string]any{
+		"inbounds": []any{
+			map[string]any{"tag": "in-vless", "type": "vless", "users": []any{}},
+		},
+	}, cfg)
+	initialBytes, _ := json.MarshalIndent(initialConfig, "", "  ")
+	_ = os.WriteFile(configPath, initialBytes, 0o644)
+
+	runtimeState := state.New("test")
+	runtimeState.SetRunningCore(state.CoreTypeSingBox)
+	runtimeState.SetOnlineStatus(true)
+	runtimeState.SetSingBoxConfig(initialConfig)
+
+	fakeSupervisor := newFakeProcessSupervisor()
+	fakeSupervisor.states[singBoxProcessName] = supervisor.StateRunning
+	manager := &Manager{
+		cfg:                cfg,
+		state:              runtimeState,
+		supervisor:         fakeSupervisor,
+		singStats:          &fakeStatsClient{},
+		runCommand:         func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
+		healthTimeout:      50 * time.Millisecond,
+		healthPollInterval: time.Millisecond,
+	}
+
+	addResp := manager.AddUser(context.Background(), AddUserRequest{
+		Data: []AddUserItem{{Type: "vless", Tag: "in-vless", Username: "user-1", UUID: "11111111-1111-1111-1111-111111111111"}},
+	})
+	if addResp["response"].(map[string]any)["success"] != true {
+		t.Fatalf("AddUser failed: %#v", addResp)
+	}
+	if hotReloadCalls != 1 || len(fakeSupervisor.stops) != 0 || len(fakeSupervisor.starts) != 0 {
+		t.Fatalf("AddUser should hot-reload without restarting: calls=%d stops=%v starts=%v", hotReloadCalls, fakeSupervisor.stops, fakeSupervisor.starts)
+	}
+
+	removeResp := manager.RemoveUser(context.Background(), RemoveUserRequest{Username: "user-1"})
+	if removeResp["response"].(map[string]any)["success"] != true {
+		t.Fatalf("RemoveUser failed: %#v", removeResp)
+	}
+	if hotReloadCalls != 2 || len(fakeSupervisor.stops) != 0 || len(fakeSupervisor.starts) != 0 {
+		t.Fatalf("RemoveUser should hot-reload without restarting: calls=%d stops=%v starts=%v", hotReloadCalls, fakeSupervisor.stops, fakeSupervisor.starts)
+	}
+
+	failHotReload = true
+	fallbackResp := manager.AddUser(context.Background(), AddUserRequest{
+		Data: []AddUserItem{{Type: "vless", Tag: "in-vless", Username: "user-2", UUID: "22222222-2222-2222-2222-222222222222"}},
+	})
+	if fallbackResp["response"].(map[string]any)["success"] != true {
+		t.Fatalf("AddUser fallback failed: %#v", fallbackResp)
+	}
+	if hotReloadCalls != 3 || len(fakeSupervisor.stops) != 1 || len(fakeSupervisor.starts) != 1 {
+		t.Fatalf("AddUser should fall back to restart on hot-reload error: calls=%d stops=%v starts=%v", hotReloadCalls, fakeSupervisor.stops, fakeSupervisor.starts)
 	}
 }
