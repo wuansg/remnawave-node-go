@@ -118,6 +118,8 @@ type RuntimeSummary struct {
 	DNSStale          bool              `json:"dnsStale"`
 	DNSLastResolvedAt *time.Time        `json:"dnsLastResolvedAt,omitempty"`
 	DNSFailureCount   uint64            `json:"dnsFailureCount"`
+	// ActiveClients is nil when forwarding is not applied or cannot be counted.
+	ActiveClients *int `json:"activeClients,omitempty"`
 }
 
 type ConflictError struct {
@@ -240,7 +242,7 @@ func (s *Service) Restore(ctx context.Context) error {
 			s.lastError = fmt.Sprintf("validate restored forwarding rules: %v", err)
 			return errors.New(s.lastError)
 		}
-		if !sameStringMap(s.resolved, prepared.resolvedTargets) {
+		if !sameStringMap(s.resolved, prepared.resolvedTargets) || !s.tableHasClientsSet(ctx) {
 			if err := s.applyPreparedLocked(ctx, s.applied, prepared, true, s.appliedHash); err != nil {
 				s.lastError = fmt.Sprintf("refresh restored forwarding targets: %v", err)
 				return errors.New(s.lastError)
@@ -350,7 +352,14 @@ func (s *Service) RuntimeSummary(ctx context.Context) RuntimeSummary {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state, lastError := s.runtimeStateLocked(ctx)
+	var activeClients *int
+	if state == "applied" || state == "degraded" {
+		if count, ok := readActiveClients(ctx); ok {
+			activeClients = &count
+		}
+	}
 	return RuntimeSummary{
+		ActiveClients:     activeClients,
 		State:             state,
 		ConfigHash:        s.appliedHash,
 		LastSyncedAt:      s.appliedAt,
@@ -692,6 +701,12 @@ func (s *Service) tableMatches(ctx context.Context, hash string) bool {
 	}
 	out, err := exec.CommandContext(ctx, "nft", "list", "table", "ip", TableName).CombinedOutput()
 	return err == nil && strings.Contains(string(out), "remnanode-forward-config:"+hash)
+}
+
+// tableHasClientsSet is false for tables rendered by agents older than the
+// clients set, which must be rendered again to start tracking clients.
+func (s *Service) tableHasClientsSet(ctx context.Context) bool {
+	return exec.CommandContext(ctx, "nft", "list", "set", "ip", TableName, clientsSetName).Run() == nil
 }
 
 func (s *Service) deleteTable(ctx context.Context) error {
@@ -1103,6 +1118,43 @@ func readCounters(ctx context.Context) (map[string]Counter, error) {
 	return result, nil
 }
 
+const (
+	clientsSetName = "rw_clients"
+	clientsTimeout = "3m"
+)
+
+// readActiveClients counts the distinct source addresses that recently sent
+// traffic through an established forwarded flow. It reports false when the
+// set cannot be read, e.g. the table predates it.
+func readActiveClients(ctx context.Context) (int, bool) {
+	out, err := exec.CommandContext(ctx, "nft", "-j", "list", "set", "ip", TableName, clientsSetName).Output()
+	if err != nil {
+		return 0, false
+	}
+	return countSetElements(out)
+}
+
+func countSetElements(raw []byte) (int, bool) {
+	var doc nftJSON
+	if json.Unmarshal(raw, &doc) != nil {
+		return 0, false
+	}
+	for _, item := range doc.NFTables {
+		rawSet, ok := item["set"]
+		if !ok {
+			continue
+		}
+		var set struct {
+			Elem []json.RawMessage `json:"elem"`
+		}
+		if json.Unmarshal(rawSet, &set) != nil {
+			return 0, false
+		}
+		return len(set.Elem), true
+	}
+	return 0, false
+}
+
 func directionCounters(values map[string]Counter, id, protocol string) DirectionCounters {
 	prefix := counterPrefix(id, protocol)
 	return DirectionCounters{Upload: values[prefix+"_up"], Download: values[prefix+"_down"]}
@@ -1130,6 +1182,9 @@ func renderRuleset(cfg Config, ingress string, routes map[string]string, hash st
 			fmt.Fprintf(&b, "  counter %s_down {}\n", prefix)
 		}
 	}
+	// Source addresses of established forwarded flows; entries expire once a
+	// client has sent nothing for clientsTimeout.
+	fmt.Fprintf(&b, "  set %s {\n    type ipv4_addr\n    size 65535\n    flags dynamic,timeout\n    timeout %s\n  }\n", clientsSetName, clientsTimeout)
 	b.WriteString("  chain prerouting {\n    type nat hook prerouting priority dstnat; policy accept;\n")
 	for _, rule := range cfg.Rules {
 		if !rule.Enabled {
@@ -1169,7 +1224,7 @@ func renderRuleset(cfg Config, ingress string, routes map[string]string, hash st
 		out := routes[rule.TargetAddress]
 		for _, proto := range expandedProtocols(rule.Protocol) {
 			prefix := counterPrefix(rule.ID, proto)
-			fmt.Fprintf(&b, "    iifname %q oifname %q ip daddr %s %s dport %d counter name %s_up\n", ingress, out, rule.TargetAddress, proto, rule.TargetPort, prefix)
+			fmt.Fprintf(&b, "    iifname %q oifname %q ip daddr %s %s dport %d counter name %s_up ct state established update @%s { ip saddr }\n", ingress, out, rule.TargetAddress, proto, rule.TargetPort, prefix, clientsSetName)
 			fmt.Fprintf(&b, "    iifname %q oifname %q ip saddr %s %s sport %d counter name %s_down\n", out, ingress, rule.TargetAddress, proto, rule.TargetPort, prefix)
 		}
 	}

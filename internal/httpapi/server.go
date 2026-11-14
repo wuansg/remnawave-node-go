@@ -297,6 +297,9 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, response)
 	}))
+	mux.HandleFunc("GET /node/stats/get-host-stats", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.manager.GetHostStats())
+	}))
 	mux.HandleFunc("POST /node/stats/get-geocheck", s.requireJWT(func(w http.ResponseWriter, r *http.Request) {
 		var body geocheck.Request
 		if !decodeJSON(w, r, &body) {

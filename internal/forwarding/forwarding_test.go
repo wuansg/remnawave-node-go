@@ -63,8 +63,11 @@ func TestRenderRulesetUsesIsolatedTableAndDirectionalCounters(t *testing.T) {
 		"dnat to 78.105.182.150:54320 comment",
 		"ct status dnat",
 		"counter name",
-		"_up",
-		"_down",
+		"_up ct state established update @rw_clients { ip saddr }\n",
+		"_down\n",
+		"set rw_clients {",
+		"flags dynamic,timeout",
+		"timeout 3m",
 	} {
 		if !strings.Contains(ruleset, expected) {
 			t.Fatalf("ruleset missing %q:\n%s", expected, ruleset)
@@ -192,6 +195,22 @@ func TestValidHostname(t *testing.T) {
 	for _, value := range []string{"", "-edge.example.com", "edge..example.com", "999.999.999.999", "edge_example.com"} {
 		if isValidHostname(value) {
 			t.Errorf("expected %q to be invalid", value)
+		}
+	}
+}
+
+func TestCountSetElements(t *testing.T) {
+	for raw, want := range map[string]int{
+		`{"nftables":[{"metainfo":{}},{"set":{"name":"rw_clients","elem":[{"elem":{"val":"198.51.100.7","timeout":180,"expires":120}},{"elem":{"val":"203.0.113.9","timeout":180,"expires":60}}]}}]}`: 2,
+		`{"nftables":[{"metainfo":{}},{"set":{"name":"rw_clients"}}]}`: 0,
+	} {
+		if got, ok := countSetElements([]byte(raw)); !ok || got != want {
+			t.Fatalf("countSetElements(%s) = %d, %v; want %d", raw, got, ok, want)
+		}
+	}
+	for _, raw := range []string{`{"nftables":[{"metainfo":{}}]}`, `not json`} {
+		if _, ok := countSetElements([]byte(raw)); ok {
+			t.Fatalf("countSetElements(%s) must report unavailable", raw)
 		}
 	}
 }

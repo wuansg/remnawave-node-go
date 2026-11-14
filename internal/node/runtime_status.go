@@ -20,6 +20,7 @@ const (
 	NetworkInventoryCapability   = "network_inventory_v1"
 	NodeAPISNICapability         = "node_api_sni_v1"
 	NodeAPISNIEnforcedCapability = "node_api_sni_enforced_v1"
+	HostStatsCapability          = "host_stats_v1"
 )
 
 type RuntimeMode string
@@ -67,7 +68,7 @@ func (m *Manager) runtimeStatus(ctx context.Context) agentRuntimeStatus {
 		State:      "unsupported",
 		DNSResults: map[string]string{},
 	}
-	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, PluginCompileCapability, PluginDNSStatusCapability, NetworkInventoryCapability, NodeAPISNICapability, "geocheck_v1", benchmark.Capability}
+	capabilities := []string{RuntimeModeCapability, SingBoxCapability, SyncStateCapability, PluginCompileCapability, PluginDNSStatusCapability, NetworkInventoryCapability, NodeAPISNICapability, HostStatsCapability, "geocheck_v1", benchmark.Capability}
 	if m.accessAudit != nil {
 		capabilities = append(capabilities, accessaudit.Capability)
 	}

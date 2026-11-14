@@ -546,6 +546,28 @@ func TestGetSystemStatsRejectsOfflineCore(t *testing.T) {
 	}
 }
 
+func TestGetHostStatsNeedsNoCore(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager := &Manager{
+		state:   state.New("test"),
+		network: system.NewNetworkMonitor(logger),
+	}
+	snapshot, ok := manager.GetHostStats()["response"].(map[string]any)["system"].(system.Snapshot)
+	if !ok {
+		t.Fatal("system must be a snapshot")
+	}
+	if snapshot.Info.CPUs < 1 || snapshot.Info.MemoryTotal == 0 {
+		t.Fatalf("unexpected host info: %#v", snapshot.Info)
+	}
+	found := false
+	for _, capability := range manager.runtimeStatus(context.Background()).Capabilities {
+		found = found || capability == HostStatsCapability
+	}
+	if !found {
+		t.Fatal("host stats capability is not advertised")
+	}
+}
+
 func TestGetSystemStatsIncludesRunningCoreInfo(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	runtimeState := state.New("test")

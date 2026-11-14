@@ -725,6 +725,16 @@ func (m *Manager) GetSystemStats(ctx context.Context) (map[string]any, error) {
 	}, nil
 }
 
+// GetHostStats reports the machine's own info and load. Unlike GetSystemStats
+// it needs no running core, so forwarding-only nodes can report it too.
+func (m *Manager) GetHostStats() map[string]any {
+	return map[string]any{
+		"response": map[string]any{
+			"system": system.SystemSnapshot(m.network),
+		},
+	}
+}
+
 func (m *Manager) GetUserOnlineStatus(ctx context.Context, request GetUserOnlineStatusRequest) map[string]any {
 	online, err := m.userConnectionProvider().UserOnlineStatus(ctx, request.Username)
 	if err != nil {
